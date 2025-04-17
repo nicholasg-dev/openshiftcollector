@@ -15,6 +15,12 @@ The OpenShift Cluster Collector is a Bash script that gathers detailed informati
 - **Parallel Processing**: Efficiently collects data using parallel jobs to minimize execution time
 - **Error Handling**: Robust error detection and reporting for failed commands
 - **Minimal Dependencies**: Requires only standard tools available in most Linux environments
+- **Category Index Pages**: Generates index pages for each resource category for easier navigation
+- **Global Search**: Builds a JSON search index for fast, full-text search across all collected files and HTML pages
+- **Breadcrumb Navigation**: Adds breadcrumbs to HTML pages for improved usability
+- **File Metadata**: Shows last modified date and file size in detail views
+- **Download & Copy Tools**: Each detail page includes buttons to copy file content or download the raw file
+- **Automatic README**: Generates a README in the output directory describing the report contents
 
 ## Prerequisites
 
@@ -88,15 +94,19 @@ The script generates a structured output directory containing:
 1. **Raw Data Files**: Organized by category in subdirectories
 2. **HTML Report**: Interactive web interface for browsing collected data
 3. **Compressed Archive**: A `.tar.gz` file containing all collected data
+4. **README.txt**: Automatically generated summary of the report contents
 
 The HTML report includes:
 
 - Dashboard with cluster health overview
 - Navigation sidebar for all resource categories
+- Category index pages for each resource type
 - Interactive tables for resource listings
 - Syntax-highlighted code views
-- Search functionality
+- Search functionality (powered by a generated JSON search index)
 - Export options (CSV, Excel, PDF)
+- Breadcrumb navigation for all pages
+- File metadata and download/copy tools
 
 ## HTML Report Features
 
@@ -104,11 +114,14 @@ The generated HTML report provides:
 
 - **Dashboard**: Overview of cluster health with key metrics
 - **Resource Navigation**: Categorized sidebar for easy navigation
+- **Category Index Pages**: Lists all files in each resource category
 - **Data Tables**: Sortable, searchable tables for resource listings
 - **Code Viewing**: Syntax highlighting for YAML, JSON, and logs
-- **Search**: Global search across all collected resources
+- **Search**: Global search across all collected resources and HTML pages
 - **Export Options**: Export data to various formats (CSV, Excel, PDF)
 - **Responsive Design**: Works on desktop and mobile devices
+- **Breadcrumbs**: Easy navigation back to category or dashboard
+- **File Tools**: Copy file content or download raw files directly from the report
 
 ## Troubleshooting
 
