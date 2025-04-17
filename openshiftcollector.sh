@@ -1007,52 +1007,168 @@ generate_datatable_page() {
     echo '<div class="table-responsive">' >> "$output_html"
     echo '<table class="table table-striped table-hover datatable" id="datatable-'$(echo "$title" | tr ' ' '-' | tr '[:upper:]' '[:lower:]')'">' >> "$output_html"
 
-    # Process the header
+    # Process the header - use awk to get the header columns
     local header_line=$(head -n 1 "$data_file")
+    local header_count=$(echo "$header_line" | awk '{print NF}')
     echo '<thead><tr>' >> "$output_html"
-    local column=1
-    for field in $header_line; do
-      echo '<th>'$field'</th>' >> "$output_html"
-      column=$((column + 1))
+
+    # Extract and output each header column
+    for ((i=1; i<=header_count; i++)); do
+      local header_field=$(echo "$header_line" | awk -v col=$i '{print $col}')
+      echo '<th>'$header_field'</th>' >> "$output_html"
     done
     echo '</tr></thead><tbody>' >> "$output_html"
 
-    # Process data rows
-    tail -n +2 "$data_file" | while read -r line; do
+    # Process data rows - use awk to handle fields with spaces
+    tail -n +2 "$data_file" | grep -v '^[[:space:]]*$' | while read -r line; do
       echo '<tr>' >> "$output_html"
 
-      local col=1
-      for field in $line; do
-        if [[ "$col" -eq "$column_index" && -n "$detail_suffix" ]]; then
-          local link_target
-          if [[ "$detail_suffix" == "../"* ]]; then
-            # This is a relative path format string
-            # shellcheck disable=SC2059
-            link_target=$(printf "$detail_suffix" "$field")
-          else
-            # This is a simple suffix
-            link_target="${field}${detail_suffix}"
-          fi
-          echo '<td><a href="'$link_target'">'$field'</a></td>' >> "$output_html"
+      # For OS-IMAGE and similar fields that contain spaces, we need special handling
+      # First, handle the special case for nodes_wide.txt which has OS-IMAGE field
+      if [[ "$data_file" == *"nodes_wide.txt" ]]; then
+        # Extract fields carefully for nodes data
+        local name=$(echo "$line" | awk '{print $1}')
+        local status=$(echo "$line" | awk '{print $2}')
+        local roles=$(echo "$line" | awk '{print $3}')
+        local age=$(echo "$line" | awk '{print $4}')
+        local version=$(echo "$line" | awk '{print $5}')
+        local internal_ip=$(echo "$line" | awk '{print $6}')
+        local external_ip=$(echo "$line" | awk '{print $7}')
+
+        # OS-IMAGE might contain spaces, extract it carefully
+        # It's between EXTERNAL-IP and KERNEL-VERSION
+        local os_image=$(echo "$line" | awk '{for(i=8;i<NF-1;i++) printf "%s ", $i; print $(NF-1)}')
+
+        # Last field is CONTAINER-RUNTIME
+        local kernel_version=$(echo "$line" | awk '{print $(NF-1)}')
+        local container_runtime=$(echo "$line" | awk '{print $NF}')
+
+        # Output each field with proper handling
+        if [[ "$column_index" -eq 1 && -n "$detail_suffix" ]]; then
+          echo '<td><a href="'$name$detail_suffix'">'$name'</a></td>' >> "$output_html"
         else
-          # Add status indicator based on certain known fields
-          case "$field" in
-            Running|True|Active|Ready|Successful|Succeeded)
-              echo '<td><span class="status-indicator status-good"></span>'$field'</td>' >> "$output_html"
-              ;;
-            Error*|Failed|False|NotReady|CrashLoopBackOff|Terminating|InvalidImageName|DeadlineExceeded)
-              echo '<td><span class="status-indicator status-error"></span>'$field'</td>' >> "$output_html"
-              ;;
-            Pending|Unknown|Warning|Provisioning|ContainerCreating|PodInitializing|SchedulingDisabled|Degraded)
-              echo '<td><span class="status-indicator status-warning"></span>'$field'</td>' >> "$output_html"
-              ;;
-            *)
-              echo '<td>'$field'</td>' >> "$output_html"
-              ;;
-          esac
+          echo '<td>'$name'</td>' >> "$output_html"
         fi
-        col=$((col + 1))
-      done
+
+        # Status with indicator
+        case "$status" in
+          Ready)
+            echo '<td><span class="status-indicator status-good"></span>'$status'</td>' >> "$output_html"
+            ;;
+          NotReady)
+            echo '<td><span class="status-indicator status-error"></span>'$status'</td>' >> "$output_html"
+            ;;
+          *)
+            echo '<td>'$status'</td>' >> "$output_html"
+            ;;
+        esac
+
+        # Remaining fields
+        echo '<td>'$roles'</td>' >> "$output_html"
+        echo '<td>'$age'</td>' >> "$output_html"
+        echo '<td>'$version'</td>' >> "$output_html"
+        echo '<td>'$internal_ip'</td>' >> "$output_html"
+        echo '<td>'$external_ip'</td>' >> "$output_html"
+        echo '<td>'$os_image'</td>' >> "$output_html"
+        echo '<td>'$kernel_version'</td>' >> "$output_html"
+        echo '<td>'$container_runtime'</td>' >> "$output_html"
+
+      # Special case for clusteroperators.txt which has MESSAGE field that might be empty
+      elif [[ "$data_file" == *"clusteroperators.txt" ]]; then
+        # Extract fields for operators data
+        local name=$(echo "$line" | awk '{print $1}')
+        local version=$(echo "$line" | awk '{print $2}')
+        local available=$(echo "$line" | awk '{print $3}')
+        local progressing=$(echo "$line" | awk '{print $4}')
+        local degraded=$(echo "$line" | awk '{print $5}')
+        local since=$(echo "$line" | awk '{print $6}')
+        local message=$(echo "$line" | awk '{for(i=7;i<=NF;i++) printf "%s ", $i}')
+
+        # Output each field with proper handling
+        if [[ "$column_index" -eq 1 && -n "$detail_suffix" ]]; then
+          echo '<td><a href="'$name$detail_suffix'">'$name'</a></td>' >> "$output_html"
+        else
+          echo '<td>'$name'</td>' >> "$output_html"
+        fi
+
+        echo '<td>'$version'</td>' >> "$output_html"
+
+        # Status indicators
+        case "$available" in
+          True)
+            echo '<td><span class="status-indicator status-good"></span>'$available'</td>' >> "$output_html"
+            ;;
+          False)
+            echo '<td><span class="status-indicator status-error"></span>'$available'</td>' >> "$output_html"
+            ;;
+          *)
+            echo '<td>'$available'</td>' >> "$output_html"
+            ;;
+        esac
+
+        case "$progressing" in
+          True)
+            echo '<td><span class="status-indicator status-warning"></span>'$progressing'</td>' >> "$output_html"
+            ;;
+          False)
+            echo '<td><span class="status-indicator status-error"></span>'$progressing'</td>' >> "$output_html"
+            ;;
+          *)
+            echo '<td>'$progressing'</td>' >> "$output_html"
+            ;;
+        esac
+
+        case "$degraded" in
+          True)
+            echo '<td><span class="status-indicator status-error"></span>'$degraded'</td>' >> "$output_html"
+            ;;
+          False)
+            echo '<td><span class="status-indicator status-error"></span>'$degraded'</td>' >> "$output_html"
+            ;;
+          *)
+            echo '<td>'$degraded'</td>' >> "$output_html"
+            ;;
+        esac
+
+        echo '<td>'$since'</td>' >> "$output_html"
+        echo '<td>'$message'</td>' >> "$output_html"
+
+      # Default case for other files
+      else
+        # Generic handling for other tables
+        local col=1
+        for field in $line; do
+          if [[ "$col" -eq "$column_index" && -n "$detail_suffix" ]]; then
+            local link_target
+            if [[ "$detail_suffix" == "../"* ]]; then
+              # This is a relative path format string
+              # shellcheck disable=SC2059
+              link_target=$(printf "$detail_suffix" "$field")
+            else
+              # This is a simple suffix
+              link_target="${field}${detail_suffix}"
+            fi
+            echo '<td><a href="'$link_target'">'$field'</a></td>' >> "$output_html"
+          else
+            # Add status indicator based on certain known fields
+            case "$field" in
+              Running|True|Active|Ready|Successful|Succeeded)
+                echo '<td><span class="status-indicator status-good"></span>'$field'</td>' >> "$output_html"
+                ;;
+              Error*|Failed|False|NotReady|CrashLoopBackOff|Terminating|InvalidImageName|DeadlineExceeded)
+                echo '<td><span class="status-indicator status-error"></span>'$field'</td>' >> "$output_html"
+                ;;
+              Pending|Unknown|Warning|Provisioning|ContainerCreating|PodInitializing|SchedulingDisabled|Degraded)
+                echo '<td><span class="status-indicator status-warning"></span>'$field'</td>' >> "$output_html"
+                ;;
+              *)
+                echo '<td>'$field'</td>' >> "$output_html"
+                ;;
+            esac
+          fi
+          col=$((col + 1))
+        done
+      fi
 
       echo '</tr>' >> "$output_html"
     done
