@@ -1162,29 +1162,33 @@ generate_category_index() {
     echo '<div class="list-group">' >> "$output_html"
 
     # Find all files in the category directory
-    find "$category_dir" -type f -not -name "*.html" | sort | while read -r file; do
-        local filename=$(basename "$file")
-        local file_path="${file#$OUTPUT_DIR/}"
-        local file_icon="fa-file-alt"
+    if [[ -d "$category_dir" ]]; then
+        find "$category_dir" -type f -not -name "*.html" | sort | while read -r file; do
+            local filename=$(basename "$file")
+            local file_path="${file#$OUTPUT_DIR/}"
+            local file_icon="fa-file-alt"
 
-        # Set appropriate icon based on file extension
-        case "${filename##*.}" in
-            yaml|yml) file_icon="fa-file-code" ;;
-            json) file_icon="fa-file-code" ;;
-            log) file_icon="fa-file-alt" ;;
-            txt) file_icon="fa-file-alt" ;;
-            err) file_icon="fa-exclamation-triangle" ;;
-            *) file_icon="fa-file" ;;
-        esac
+            # Set appropriate icon based on file extension
+            case "${filename##*.}" in
+                yaml|yml) file_icon="fa-file-code" ;;
+                json) file_icon="fa-file-code" ;;
+                log) file_icon="fa-file-alt" ;;
+                txt) file_icon="fa-file-alt" ;;
+                err) file_icon="fa-exclamation-triangle" ;;
+                *) file_icon="fa-file" ;;
+            esac
 
-        # Add file size
-        local file_size=$(du -h "$file" | cut -f1 2>/dev/null || echo "N/A")
+            # Add file size
+            local file_size=$(du -h "$file" | cut -f1 2>/dev/null || echo "N/A")
 
-        echo '<a href="'$file_path'.html" class="list-group-item list-group-item-action">' >> "$output_html"
-        echo '<i class="fas '$file_icon' me-2"></i>'$filename >> "$output_html"
-        echo '<span class="badge bg-secondary float-end">'$file_size'</span>' >> "$output_html"
-        echo '</a>' >> "$output_html"
-    done
+            echo '<a href="'$file_path'.html" class="list-group-item list-group-item-action">' >> "$output_html"
+            echo '<i class="fas '$file_icon' me-2"></i>'$filename >> "$output_html"
+            echo '<span class="badge bg-secondary float-end">'$file_size'</span>' >> "$output_html"
+            echo '</a>' >> "$output_html"
+        done
+    else
+        echo '<div class="alert alert-info">No files found in this category.</div>' >> "$output_html"
+    fi
 
     echo '</div>' >> "$output_html"
     echo '</div>' >> "$output_html"
@@ -1198,8 +1202,11 @@ generate_search_index() {
     log "Generating search index..."
     local search_index="${OUTPUT_DIR}/search_index.json"
 
+    # Create a temporary file for building the index
+    local temp_index=$(mktemp)
+
     # Start the JSON array
-    echo '[' > "$search_index"
+    echo '[' > "$temp_index"
 
     # Find all text files and add them to the index
     local first_entry=true
@@ -1214,18 +1221,18 @@ generate_search_index() {
         local category=$(dirname "$file" | sed "s|${OUTPUT_DIR}/||")
         local title="$filename"
 
-        # Extract a sample of content for search
-        local content=$(head -n 50 "$file" | tr '\n' ' ' | sed 's/"/\\"/g')
+        # Extract a sample of content for search (limit to 1000 chars to avoid huge index)
+        local content=$(head -n 20 "$file" | tr '\n' ' ' | sed 's/"/\\"/g' | cut -c 1-1000)
 
         # Add comma before entry if not the first one
         if [ "$first_entry" = true ]; then
             first_entry=false
         else
-            echo ',' >> "$search_index"
+            echo ',' >> "$temp_index"
         fi
 
         # Write the entry to the search index
-        cat << EOF >> "$search_index"
+        cat << EOF >> "$temp_index"
 {
   "title": "$title",
   "path": "$file_path.html",
@@ -1236,7 +1243,10 @@ EOF
     done
 
     # Close the JSON array
-    echo ']' >> "$search_index"
+    echo ']' >> "$temp_index"
+
+    # Move the temp file to the final location
+    mv "$temp_index" "$search_index"
     log "Search index generated: $search_index"
 }
 
@@ -1251,19 +1261,29 @@ generate_report() {
         [[ -d "$dir" ]] && [[ $(find "$dir" -type f | wc -l) -gt 0 ]]
     }
 
-    # Only generate category index pages for directories that exist and have content
-    has_content "${OUTPUT_DIR}/nodes" && generate_category_index "nodes" "Nodes" "${OUTPUT_DIR}/nodes" "${OUTPUT_DIR}/nodes_index.html"
-    has_content "${OUTPUT_DIR}/operators" && generate_category_index "operators" "Operators" "${OUTPUT_DIR}/operators" "${OUTPUT_DIR}/operators_index.html"
-    has_content "${OUTPUT_DIR}/network" && generate_category_index "network" "Network" "${OUTPUT_DIR}/network" "${OUTPUT_DIR}/network_index.html"
-    has_content "${OUTPUT_DIR}/security" && generate_category_index "security" "Security" "${OUTPUT_DIR}/security" "${OUTPUT_DIR}/security_index.html"
-    has_content "${OUTPUT_DIR}/namespaces" && generate_category_index "namespaces" "Namespaces" "${OUTPUT_DIR}/namespaces" "${OUTPUT_DIR}/namespaces_index.html"
-    has_content "${OUTPUT_DIR}/cluster_resources" && generate_category_index "cluster_resources" "Cluster Resources" "${OUTPUT_DIR}/cluster_resources" "${OUTPUT_DIR}/cluster_resources_index.html"
-    has_content "${OUTPUT_DIR}/storage" && generate_category_index "storage" "Storage" "${OUTPUT_DIR}/storage" "${OUTPUT_DIR}/storage_index.html"
-    has_content "${OUTPUT_DIR}/rbac" && generate_category_index "rbac" "RBAC" "${OUTPUT_DIR}/rbac" "${OUTPUT_DIR}/rbac_index.html"
-    has_content "${OUTPUT_DIR}/audit_logs" && generate_category_index "audit" "Audit Logs" "${OUTPUT_DIR}/audit_logs" "${OUTPUT_DIR}/audit_index.html"
-    has_content "${OUTPUT_DIR}/logs" && generate_category_index "logs" "Logs" "${OUTPUT_DIR}/logs" "${OUTPUT_DIR}/logs_index.html"
-    has_content "${OUTPUT_DIR}/version" && generate_category_index "version" "Version History" "${OUTPUT_DIR}/version" "${OUTPUT_DIR}/version_index.html"
-    has_content "${OUTPUT_DIR}/etcd" && generate_category_index "etcd" "ETCD" "${OUTPUT_DIR}/etcd" "${OUTPUT_DIR}/etcd_index.html"
+    # Generate all category index pages referenced in the sidebar
+    # This ensures we have all the pages that are linked in the navigation
+    generate_category_index "basic" "Basic Info" "${OUTPUT_DIR}" "${OUTPUT_DIR}/basic_index.html"
+    generate_category_index "clusterversion_history" "Version History" "${OUTPUT_DIR}/version" "${OUTPUT_DIR}/clusterversion_history_index.html"
+    generate_category_index "nodes" "Nodes" "${OUTPUT_DIR}/nodes" "${OUTPUT_DIR}/nodes_index.html"
+    generate_category_index "operators" "Operators" "${OUTPUT_DIR}/operators" "${OUTPUT_DIR}/operators_index.html"
+    generate_category_index "etcd" "etcd" "${OUTPUT_DIR}/etcd" "${OUTPUT_DIR}/etcd_index.html"
+    generate_category_index "api_resources" "API Resources" "${OUTPUT_DIR}" "${OUTPUT_DIR}/api_resources_index.html"
+    generate_category_index "namespaces" "Namespaces" "${OUTPUT_DIR}/namespaces" "${OUTPUT_DIR}/namespaces_index.html"
+    generate_category_index "namespace_resources" "Namespace Details" "${OUTPUT_DIR}/namespace_resources" "${OUTPUT_DIR}/namespace_resources_index.html"
+    generate_category_index "cluster_resources" "Cluster Resources" "${OUTPUT_DIR}/cluster_resources" "${OUTPUT_DIR}/cluster_resources_index.html"
+    generate_category_index "crd_instances" "CRD Instances" "${OUTPUT_DIR}/crd_instances" "${OUTPUT_DIR}/crd_instances_index.html"
+    generate_category_index "builds" "Builds & Images" "${OUTPUT_DIR}/builds" "${OUTPUT_DIR}/builds_index.html"
+    generate_category_index "network" "Networking" "${OUTPUT_DIR}/network" "${OUTPUT_DIR}/network_index.html"
+    generate_category_index "storage" "Storage" "${OUTPUT_DIR}/storage" "${OUTPUT_DIR}/storage_index.html"
+    generate_category_index "machine_api" "Machine API" "${OUTPUT_DIR}/machine_api" "${OUTPUT_DIR}/machine_api_index.html"
+    generate_category_index "security" "Security" "${OUTPUT_DIR}/security" "${OUTPUT_DIR}/security_index.html"
+    generate_category_index "rbac" "RBAC" "${OUTPUT_DIR}/rbac" "${OUTPUT_DIR}/rbac_index.html"
+    generate_category_index "metrics" "Metrics" "${OUTPUT_DIR}/metrics" "${OUTPUT_DIR}/metrics_index.html"
+    generate_category_index "autoscalers" "Autoscalers" "${OUTPUT_DIR}/autoscalers" "${OUTPUT_DIR}/autoscalers_index.html"
+    generate_category_index "events" "Events" "${OUTPUT_DIR}/events" "${OUTPUT_DIR}/events_index.html"
+    generate_category_index "logs" "Logs" "${OUTPUT_DIR}/logs" "${OUTPUT_DIR}/logs_index.html"
+    generate_category_index "audit" "Audit Config" "${OUTPUT_DIR}/audit" "${OUTPUT_DIR}/audit_index.html"
 
     # DataTable pages for tabular data - only generate if file exists
     if [ -f "${OUTPUT_DIR}/nodes/nodes_wide.txt" ]; then
@@ -1274,7 +1294,7 @@ generate_report() {
     fi
 
     # Generic detail pages (YAML, JSON, log, txt)
-    for f in $(find "${OUTPUT_DIR}" -type f \( -name "*.yaml" -o -name "*.json" -o -name "*.log" -o -name "*.txt" \)); do
+    for f in $(find "${OUTPUT_DIR}" -type f \( -name "*.yaml" -o -name "*.json" -o -name "*.log" -o -name "*.txt" -o -name "*.err" \)); do
       # Skip empty files
       if [[ ! -s "$f" ]]; then
         log "  [SKIP] Empty file: $f"
@@ -1285,7 +1305,9 @@ generate_report() {
       case "$ext" in
         yaml|yml) lang="yaml" ;;
         json) lang="json" ;;
-        log|txt) lang="text" ;;
+        log) lang="log" ;;
+        txt) lang="text" ;;
+        err) lang="text" ;;
         *) lang="text" ;;
       esac
       category=$(dirname "$f" | sed "s|${OUTPUT_DIR}/||")
@@ -1294,6 +1316,26 @@ generate_report() {
 
     # Generate search index for global search functionality
     generate_search_index
+
+    # Create a simple README file in the output directory
+    cat << EOF > "${OUTPUT_DIR}/README.txt"
+OpenShift Cluster Report
+=======================
+
+This report contains information collected from an OpenShift cluster.
+To view the report, open the index.html file in a web browser.
+
+The report includes:
+- Cluster configuration
+- Node information
+- Operator status
+- Network configuration
+- Storage resources
+- Security settings
+- And more...
+
+Use the global search feature to search across all files in the report.
+EOF
 
     log "HTML Report generation complete: ${OUTPUT_DIR}/index.html"
 }
