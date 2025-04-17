@@ -10,17 +10,14 @@ The OpenShift Cluster Collector is a Bash script that gathers detailed informati
 
 - **Comprehensive Data Collection**: Gathers information about all major OpenShift components and resources
 - **Interactive HTML Report**: Generates a modern, responsive web interface to browse collected data
+- **Interactive Dashboard**: Features dynamic widgets showing cluster health and resource usage
+- **Data Visualization**: Includes charts and graphs for resource trends and status
 - **Resource Visualization**: Presents tabular data in searchable, sortable tables
 - **Syntax Highlighting**: Properly formats YAML, JSON, and log files for easy reading
 - **Parallel Processing**: Efficiently collects data using parallel jobs to minimize execution time
 - **Error Handling**: Robust error detection and reporting for failed commands
+- **Global Search**: Search functionality across all collected resources
 - **Minimal Dependencies**: Requires only standard tools available in most Linux environments
-- **Category Index Pages**: Generates index pages for each resource category for easier navigation
-- **Global Search**: Builds a JSON search index for fast, full-text search across all collected files and HTML pages
-- **Breadcrumb Navigation**: Adds breadcrumbs to HTML pages for improved usability
-- **File Metadata**: Shows last modified date and file size in detail views
-- **Download & Copy Tools**: Each detail page includes buttons to copy file content or download the raw file
-- **Automatic README**: Generates a README in the output directory describing the report contents
 
 ## Prerequisites
 
@@ -94,34 +91,34 @@ The script generates a structured output directory containing:
 1. **Raw Data Files**: Organized by category in subdirectories
 2. **HTML Report**: Interactive web interface for browsing collected data
 3. **Compressed Archive**: A `.tar.gz` file containing all collected data
-4. **README.txt**: Automatically generated summary of the report contents
 
 The HTML report includes:
 
-- Dashboard with cluster health overview
+- Interactive dashboard with dynamic widgets and charts
+- Real-time cluster health and status indicators
+- Resource usage visualizations with Chart.js
 - Navigation sidebar for all resource categories
-- Category index pages for each resource type
 - Interactive tables for resource listings
 - Syntax-highlighted code views
-- Search functionality (powered by a generated JSON search index)
+- Global search functionality
 - Export options (CSV, Excel, PDF)
-- Breadcrumb navigation for all pages
-- File metadata and download/copy tools
 
 ## HTML Report Features
 
 The generated HTML report provides:
 
-- **Dashboard**: Overview of cluster health with key metrics
+- **Interactive Dashboard**: Dynamic overview of cluster health with real-time widgets
+- **Status Widgets**: Visual indicators for cluster, node, and operator health
+- **Resource Usage Charts**: Visual representation of CPU and memory usage
+- **Node Readiness Trends**: Chart showing node readiness over time
+- **Event Monitoring**: Recent events and warnings at a glance
+- **Failed Pods Summary**: Quick view of problematic workloads
 - **Resource Navigation**: Categorized sidebar for easy navigation
-- **Category Index Pages**: Lists all files in each resource category
 - **Data Tables**: Sortable, searchable tables for resource listings
 - **Code Viewing**: Syntax highlighting for YAML, JSON, and logs
-- **Search**: Global search across all collected resources and HTML pages
+- **Search**: Global search across all collected resources
 - **Export Options**: Export data to various formats (CSV, Excel, PDF)
 - **Responsive Design**: Works on desktop and mobile devices
-- **Breadcrumbs**: Easy navigation back to category or dashboard
-- **File Tools**: Copy file content or download raw files directly from the report
 
 ## Troubleshooting
 
@@ -130,6 +127,8 @@ The generated HTML report provides:
 - **Bash Version**: Check your Bash version with `bash --version` - must be 4.0 or newer
 - **Missing Dependencies**: Install any missing utilities reported during script execution
 - **Large Clusters**: For very large clusters, increase `PARALLEL_JOBS` for faster collection
+- **Path Issues**: The script creates symbolic links to handle path resolution issues when viewing the report through a web server
+- **CORS Issues**: Use the included `serve_report.sh` script to avoid CORS issues when viewing the report locally
 
 ## Examples
 
@@ -140,6 +139,15 @@ The generated HTML report provides:
 ```
 
 This will create a timestamped directory with all collected data and generate an HTML report.
+
+To view the report, use the included server script:
+
+```bash
+cd <report_directory>
+./serve_report.sh
+```
+
+Then open your browser and navigate to http://localhost:8000/
 
 ### Custom Collection
 
@@ -158,6 +166,57 @@ This will:
 - Secret data is redacted in the output
 - Handle the generated report securely as it contains cluster configuration details
 - Consider removing sensitive information before sharing reports
+
+## Dashboard Widgets
+
+The dashboard includes the following interactive widgets:
+
+1. **Cluster Status Widget**
+   - Shows overall cluster health status
+   - Displays OpenShift version information
+   - Indicates if the cluster is healthy, degraded, or updating
+
+2. **Node Status Widget**
+   - Displays total node count
+   - Shows ready vs. not ready nodes
+   - Visual health indicator
+
+3. **Operator Status Widget**
+   - Shows total operator count
+   - Displays available, degraded, and progressing operators
+   - Visual health indicator
+
+4. **Resource Usage Widget**
+   - Shows CPU and memory usage across the cluster
+   - Visual progress bars with percentage indicators
+   - Color-coded based on utilization levels
+
+5. **Node Readiness Chart**
+   - Trend chart showing node readiness over time
+   - Visualizes cluster stability
+
+6. **Event Summary Widget**
+   - Shows recent cluster events
+   - Highlights warnings and normal events
+   - Quick access to full event logs
+
+7. **Failed Pods Widget**
+   - Lists pods in failed state
+   - Shows failure reasons
+   - Quick access to namespace details
+
+## Adding Dashboard Widgets to Existing Reports
+
+If you have an existing report generated before this feature was added, you can add the dashboard widgets using the provided utility script:
+
+```bash
+./add_dashboard_widgets.sh <report_directory>
+```
+
+This will:
+1. Add the necessary widget containers to the dashboard
+2. Add Chart.js for data visualization
+3. Include the dashboard_widgets.js script
 
 ## License
 
