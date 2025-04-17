@@ -1,9 +1,586 @@
+#!/usr/bin/env bash
+
+# Ensure the script is run with Bash
+if [ -z "$BASH_VERSION" ]; then
+  exec bash "$0" "$@"
+fi
+
+# Ensure Bash version is at least 4.0 for associative arrays
+if ((BASH_VERSINFO[0] < 4)); then
+  # Attempt to find and switch to Bash 4+ installed via Homebrew
+  for brew_bash in /usr/local/bin/bash /opt/homebrew/bin/bash; do
+    if [ -x "$brew_bash" ]; then
+      ver=$("$brew_bash" -c 'echo ${BASH_VERSINFO[0]}')
+      if ((ver >= 4)); then
+        exec "$brew_bash" "$0" "$@"
+      fi
+    fi
+  done
+  echo "This script requires Bash 4.0 or newer (associative arrays are not supported in Bash 3.x)."
+  exit 1
+fi
+
+# OpenShift Cluster Collector Script
+# Collects configuration & settings, then generates a comprehensive HTML report.
+# Usage: [env OUTPUT_DIR=...] [env LOG_LINES=...] [env PARALLEL_JOBS=...] ./openshiftcollector.sh
+
+# --- Configurable variables ---
+OUTPUT_DIR="${OUTPUT_DIR:-ocp_cluster_report_$(date +%Y%m%d_%H%M%S)}"
+COLLECT_LOGS=${COLLECT_LOGS:-true}
+LOG_LINES=${LOG_LINES:-200}
+PARALLEL_JOBS=${PARALLEL_JOBS:-4}
+MAX_LOG_LINES=${MAX_LOG_LINES:-1000}
+
+# --- HTML Structure Configuration ---
+# Define categories for HTML sidebar navigation and organization
+# Key: Internal category ID used for directory names and linking
+# Value: Display Name for the sidebar
+declare -A CATEGORIES=(
+    ["dashboard"]="Dashboard" # Special case for the main index
+    ["basic"]="Basic Info"
+    ["clusterversion_history"]="Version History"
+    ["nodes"]="Nodes"
+    ["operators"]="Operators"
+    ["etcd"]="etcd"
+    ["api_resources"]="API Resources"
+    ["namespaces"]="Namespaces"
+    ["namespace_resources"]="Namespace Details"
+    ["cluster_resources"]="Cluster Resources"
+    ["crd_instances"]="CRD Instances"
+    ["builds"]="Builds & Images"
+    ["network"]="Networking"
+    ["storage"]="Storage"
+    ["machine_api"]="Machine API"
+    ["security"]="Security"
+    ["rbac"]="RBAC"
+    ["metrics"]="Metrics"
+    ["autoscalers"]="Autoscalers"
+    ["events"]="Events"
+    ["logs"]="Logs"
+    ["audit"]="Audit Config"
+)
+
+# Files suitable for DataTables rendering
+# Key: Basename of the source file (relative to category dir)
+# Value: "LinkColumnIndex,DetailFileSuffix"
+#   - LinkColumnIndex: 1-based index of the column whose value is used for linking. 0 or empty means no link.
+#   - DetailFileSuffix: Suffix to append to the linked value to form the detail file name (e.g., _describe.txt). Empty means link to a directory/page named after the value.
+declare -A DATATABLE_FILES=(
+    # Nodes
+    ["nodes_wide.txt"]="1,_describe.txt.html" # Column 1 (NAME) links to {NAME}_describe.txt.html
+    # Operators
+    ["clusteroperators.txt"]="1,_describe.txt.html" # Column 1 (NAME) links to {NAME}_describe.txt.html (Note: describe CO not collected by default)
+    ["olm/subscriptions.txt"]="2," # Column 2 (NAME), no specific detail file, link to default view maybe? (Needs refinement if specific detail exists)
+    ["olm/install_plans.txt"]="2,"
+    ["olm/catalogsources.txt"]="2,"
+    # Namespaces
+    ["projects.txt"]="1,../namespace_resources/%s/index.html" # Column 1 (NAME) links to namespace detail index page
+    # Network
+    ["netnamespaces.txt"]="1," # Needs detail page definition if applicable
+    ["hostsubnets.txt"]="1," # Needs detail page definition if applicable
+    # Metrics
+    ["node_usage.txt"]="1," # Link to node detail? Maybe nodes_index.html#node-<name>
+    ["pod_usage.txt"]="2," # Link to pod detail? Complex.
+    # Logs
+    ["high_restart_pods.txt"]="2," # Link to pod log?
+    # Security
+    ["cert_expiry.txt"]="2," # Link to secret details? Maybe security_index.html#secret-<ns>-<name>
+)
+
+set -uo pipefail
+# Consider adding 'set -e' after initial debugging
+
+# --- Logging and progress functions ---
+log() {
+    echo "[$(date +'%Y-%m-%d %H:%M:%S')] $*"
+}
+
+# Track progress for display
+TOTAL_STEPS=15
+CURRENT_STEP=0
+
+show_progress() {
+    local step_name="$1"
+    CURRENT_STEP=$((CURRENT_STEP + 1))
+    local percent=$((CURRENT_STEP * 100 / TOTAL_STEPS))
+    local bar_length=50
+    local filled_length=$((bar_length * CURRENT_STEP / TOTAL_STEPS))
+
+    # Create the progress bar
+    local bar=""
+    for ((i=0; i<filled_length; i++)); do
+        bar="${bar}#"
+    done
+    for ((i=filled_length; i<bar_length; i++)); do
+        bar="${bar}-"
+    done
+
+    # Print the progress bar
+    printf "\r[%3d%%] [%s] %s" "$percent" "$bar" "$step_name"
+
+    # Print a newline if we're done
+    if [ "$CURRENT_STEP" -eq "$TOTAL_STEPS" ]; then
+        echo ""
+    fi
+}
+
+# --- Dependency checks ---
+for bin in oc xargs awk grep sort head cut base64 openssl jq tree mktemp find sed dirname basename; do
+    if ! command -v "$bin" &>/dev/null; then
+        echo "Error: '$bin' command not found. Please install it."
+        exit 1
+    fi
+done
+
+if ! oc whoami &>/dev/null; then
+    echo "Error: Not logged in to OpenShift cluster."
+    exit 1
+fi
+
+mkdir -p "${OUTPUT_DIR}"
+log "Collecting OpenShift cluster details to ${OUTPUT_DIR}"
+
+# --- Helper to run oc commands with retry logic ---
+run_oc() {
+    local outfile="$1"
+    local errfile="$2"
+    local optional_resource=${3:-false} # Pass true as 3rd arg if resource might not exist
+    shift 3 # Shift past outfile, errfile, optional_flag
+    local cmd_display="oc $*"
+    local max_retries=3
+    local retry_count=0
+    local retry_delay=2
+
+    log "  [CMD] Running: $cmd_display"
+
+    # Ensure target directory exists
+    mkdir -p "$(dirname "$outfile")"
+
+    # Retry loop for transient errors
+    while [ $retry_count -lt $max_retries ]; do
+        if oc "$@" > "$outfile" 2> "$errfile"; then
+            log "    [SUCCESS] Command succeeded: $cmd_display"
+            # Remove error file only if it's empty
+            [ -s "$errfile" ] || rm -f "$errfile"
+            return 0
+        else
+            local rc=$?
+            # Check if this is a "not found" for an optional resource
+            if [[ "$optional_resource" == true ]] && grep -qE "(NotFound|doesn't have a resource type|the server could not find the requested resource)" "$errfile"; then
+                log "    [INFO] Optional resource not found (rc=$rc): $cmd_display"
+                echo "Resource not found or API not present." > "$outfile" # Overwrite outfile with info
+                # Keep the error file for reference if it contains more than just the 'not found' message
+                if ! grep -qE '^[[:space:]]*(NotFound|doesn'"'"'t have a resource type|the server could not find the requested resource)[[:space:]]*$' "$errfile"; then
+                     log "    [INFO] Keeping non-empty error file: $errfile"
+                else
+                    rm -f "$errfile" # Remove simple 'not found' error file
+                fi
+                return 0
+            fi
+
+            # Check for transient errors that we should retry
+            if grep -qE "(connection refused|timeout|TLS handshake|temporarily unavailable|too many requests)" "$errfile"; then
+                retry_count=$((retry_count + 1))
+                if [ $retry_count -lt $max_retries ]; then
+                    local wait_time=$((retry_delay * retry_count))
+                    log "    [RETRY] Command failed with transient error (rc=$rc), retrying in ${wait_time}s (attempt $retry_count/$max_retries): $cmd_display"
+                    sleep $wait_time
+                    continue
+                fi
+            fi
+
+            # If we get here, it's a non-retryable error or we've exhausted retries
+            log "    [ERROR] Command failed (rc=$rc): $cmd_display"
+            # Prepend error message to the output file instead of replacing it entirely
+            local tmp_out; tmp_out=$(mktemp)
+            {
+                echo "[ERROR] Command failed (rc=$rc): $cmd_display"
+                echo "--- Error Output (stderr) ---"
+                cat "$errfile"
+                echo "--- End Error Output ---"
+                echo "--- Original Output (stdout, if any) ---"
+                cat "$outfile" # Append original stdout if any exists
+            } > "$tmp_out"
+            mv "$tmp_out" "$outfile"
+            # Don't remove the error file in case of failure
+            break
+        fi
+    done
+
+    # We only get here if all retries failed or it was a non-retryable error
+    if [ $retry_count -ge 1 ]; then
+        log "    [WARN] Command failed after $retry_count retries: $cmd_display"
+    fi
+
+    # Ensure the function always returns success for the script flow
+    return 0
+}
+
+# Base collection functions
+collect_basic() {
+    log "[PROGRESS] Collecting basic cluster info..."
+    run_oc "${OUTPUT_DIR}/oc_version.txt" "${OUTPUT_DIR}/oc_version.err" false version
+    run_oc "${OUTPUT_DIR}/clusterversion.yaml" "${OUTPUT_DIR}/clusterversion.err" false get clusterversion -o yaml
+    run_oc "${OUTPUT_DIR}/clusterversion_describe.txt" "${OUTPUT_DIR}/clusterversion_describe.err" false describe clusterversion
+    run_oc "${OUTPUT_DIR}/cluster_info.txt" "${OUTPUT_DIR}/cluster_info.err" false cluster-info
+    run_oc "${OUTPUT_DIR}/infrastructure.yaml" "${OUTPUT_DIR}/infrastructure.err" false get infrastructure cluster -o yaml
+    log "[DONE] Basic cluster info collected."
+}
+
+collect_nodes() {
+    log "[PROGRESS] Collecting node details..."
+    mkdir -p "${OUTPUT_DIR}/nodes"
+    run_oc "${OUTPUT_DIR}/nodes/nodes_wide.txt" "${OUTPUT_DIR}/nodes/nodes_wide.err" false get nodes -o wide
+    NODES=$(oc get nodes -o jsonpath='{.items[*].metadata.name}')
+    for node in $NODES; do
+        log "  [NODE] Collecting details for $node..."
+        run_oc "${OUTPUT_DIR}/nodes/${node}_describe.txt" "${OUTPUT_DIR}/nodes/${node}_describe.err" false describe node "$node" &
+        if (( $(jobs -r -p | wc -l) >= PARALLEL_JOBS )); then wait; fi
+    done
+    wait
+    log "[DONE] Node details collected."
+}
+
+collect_operators() {
+    log "[PROGRESS] Collecting operator details..."
+    mkdir -p "${OUTPUT_DIR}/operators"
+    run_oc "${OUTPUT_DIR}/operators/clusteroperators.txt" "${OUTPUT_DIR}/operators/clusteroperators.err" false get clusteroperators -o wide
+    run_oc "${OUTPUT_DIR}/operators/cluster_service_versions.txt" "${OUTPUT_DIR}/operators/cluster_service_versions.err" false get csv --all-namespaces -o wide
+    mkdir -p "${OUTPUT_DIR}/operators/olm"
+    run_oc "${OUTPUT_DIR}/operators/olm/subscriptions.txt" "${OUTPUT_DIR}/operators/olm/subscriptions.err" false get subscriptions --all-namespaces -o wide
+    run_oc "${OUTPUT_DIR}/operators/olm/install_plans.txt" "${OUTPUT_DIR}/operators/olm/install_plans.err" false get installplans --all-namespaces -o wide
+    run_oc "${OUTPUT_DIR}/operators/olm/catalogsources.txt" "${OUTPUT_DIR}/operators/olm/catalogsources.err" false get catalogsources --all-namespaces -o wide
+    log "[DONE] Operator details collected."
+}
+
+collect_network() {
+    log "[PROGRESS] Collecting network configuration..."
+    mkdir -p "${OUTPUT_DIR}/network"
+    run_oc "${OUTPUT_DIR}/network/network_config.yaml" "${OUTPUT_DIR}/network/network_config.err" false get network.config/cluster -o yaml
+    if run_oc "${OUTPUT_DIR}/network/netnamespace.txt" "${OUTPUT_DIR}/network/netnamespace.err" true api-resources | grep -q netnamespace; then
+        run_oc "${OUTPUT_DIR}/network/netnamespaces.txt" "${OUTPUT_DIR}/network/netnamespaces.err" false get netnamespace -o wide
+    fi
+    if run_oc "${OUTPUT_DIR}/network/hostsubnet.txt" "${OUTPUT_DIR}/network/hostsubnet.err" true api-resources | grep -q hostsubnet; then
+        run_oc "${OUTPUT_DIR}/network/hostsubnets.txt" "${OUTPUT_DIR}/network/hostsubnets.err" false get hostsubnet -o wide
+    fi
+    run_oc "${OUTPUT_DIR}/network/connectivity_check.txt" "${OUTPUT_DIR}/network/connectivity_check.err" true run connectivity-test --image=busybox --rm -i --restart=Never -- sh -c 'echo DNS Test:  && nslookup kubernetes.default && echo \nHTTP Connectivity: && wget -qO- http://google.com'
+    if grep -q 'Error from server' "${OUTPUT_DIR}/network/connectivity_check.err"; then
+      echo "WARNING: Could not run connectivity test pod. This may be due to cluster security policies or missing image permissions." >> "${OUTPUT_DIR}/network/connectivity_check.txt"
+    fi
+    log "[DONE] Network configuration collected."
+}
+
+collect_security() {
+    log "[PROGRESS] Collecting security details..."
+    mkdir -p "${OUTPUT_DIR}/security"
+    run_oc "${OUTPUT_DIR}/security/secrets.txt" "${OUTPUT_DIR}/security/secrets.err" false get secrets --all-namespaces -o jsonpath='{range .items[?(@.type=="kubernetes.io/tls")]}{.metadata.namespace}{"|"}{.metadata.name}{"\n"}{end}' | \
+      while read -r line; do
+        NS=$(echo "$line" | cut -d'|' -f1)
+        NAME=$(echo "$line" | cut -d'|' -f2)
+        CRT_B64=$(oc get secret -n "$NS" "$NAME" -o jsonpath='{.data.tls\.crt}' 2>/dev/null)
+        if [[ -n "$CRT_B64" ]]; then
+          echo "$CRT_B64" | base64 -d 2>/dev/null | openssl x509 -noout -dates 2>/dev/null | \
+            awk -v ns="$NS" -v name="$NAME" '{print ns,"|",name,"|",$0}' >> "${OUTPUT_DIR}/security/cert_expiry.txt"
+        fi
+      done
+    run_oc "${OUTPUT_DIR}/security/scc.yaml" "${OUTPUT_DIR}/security/scc.err" false get scc -o yaml
+    run_oc "${OUTPUT_DIR}/security/oauth_cluster.yaml" "${OUTPUT_DIR}/security/oauth_cluster.err" false get oauth cluster -o yaml
+    log "[DONE] Security details collected."
+}
+
+collect_metrics() {
+    log "[PROGRESS] Collecting metrics..."
+    mkdir -p "${OUTPUT_DIR}/metrics"
+    run_oc "${OUTPUT_DIR}/metrics/node_usage.txt" "${OUTPUT_DIR}/metrics/node_usage.err" false adm top nodes --no-headers
+    run_oc "${OUTPUT_DIR}/metrics/pod_usage.txt" "${OUTPUT_DIR}/metrics/pod_usage.err" false adm top pods --all-namespaces --no-headers
+    run_oc "${OUTPUT_DIR}/metrics/cluster_capacity.txt" "${OUTPUT_DIR}/metrics/cluster_capacity.err" false get nodes -o jsonpath='{range .items[*]}{.status.capacity}{\"\n\"}{end}'
+    log "[DONE] Metrics collected."
+}
+
+collect_etcd() {
+    log "[PROGRESS] Collecting etcd details..."
+    mkdir -p "${OUTPUT_DIR}/etcd"
+
+    # Get etcd pod name first
+    local etcd_pod=$(oc get pods -n openshift-etcd -l app=etcd -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+
+    if [[ -n "$etcd_pod" ]]; then
+        # Run etcd health check
+        run_oc "${OUTPUT_DIR}/etcd/health.txt" "${OUTPUT_DIR}/etcd/health.err" false rsh -n openshift-etcd $etcd_pod etcdctl endpoint health 2>&1
+
+        # Run etcd member list
+        run_oc "${OUTPUT_DIR}/etcd/members.txt" "${OUTPUT_DIR}/etcd/members.err" false rsh -n openshift-etcd $etcd_pod etcdctl member list -w table 2>&1
+    else
+        echo "No etcd pods found" > "${OUTPUT_DIR}/etcd/pods.txt"
+        log "  [WARN] No etcd pods found"
+    fi
+
+    log "[DONE] etcd details collected."
+}
+
+collect_logs() {
+    log "[PROGRESS] Collecting logs..."
+    if [ "$COLLECT_LOGS" = true ]; then
+        mkdir -p "${OUTPUT_DIR}/logs"
+        for NS in openshift-apiserver openshift-etcd openshift-kube-apiserver; do
+            log "  [LOGS] Collecting logs for $NS..."
+            mkdir -p "${OUTPUT_DIR}/logs/$NS"
+
+            # Get pods in the namespace
+            pods=$(oc get pods -n "$NS" -o jsonpath='{.items[*].metadata.name}' 2>/dev/null)
+
+            if [[ -n "$pods" ]]; then
+                for pod in $pods; do
+                    log "    [POD] Getting logs from $pod..."
+                    # Create a directory for each pod
+                    mkdir -p "${OUTPUT_DIR}/logs/$NS/$pod"
+
+                    # Get containers in the pod
+                    containers=$(oc get pod "$pod" -n "$NS" -o jsonpath='{.spec.containers[*].name}' 2>/dev/null)
+
+                    if [[ -n "$containers" ]]; then
+                        for container in $containers; do
+                            log "      [CONTAINER] Getting logs from $container..."
+                            # Limit log size to avoid excessive file sizes
+                            run_oc "${OUTPUT_DIR}/logs/$NS/$pod/${container}.log" "${OUTPUT_DIR}/logs/$NS/$pod/${container}.err" false logs "$pod" -n "$NS" -c "$container" --tail=$MAX_LOG_LINES 2>&1
+                        done
+                    else
+                        echo "No containers found in pod $pod" > "${OUTPUT_DIR}/logs/$NS/$pod/no_containers.txt"
+                    fi
+                done
+            else
+                echo "No pods found in namespace $NS" > "${OUTPUT_DIR}/logs/$NS/no_pods.txt"
+                log "    [WARN] No pods found in namespace $NS"
+            fi
+        done
+    else
+        log "  [SKIP] Log collection disabled"
+    fi
+    log "[DONE] Logs collected."
+}
+
+collect_namespaces() {
+    log "[PROGRESS] Collecting namespaces and basic resources..."
+    mkdir -p "${OUTPUT_DIR}/namespaces"
+    run_oc "${OUTPUT_DIR}/namespaces/projects.txt" "${OUTPUT_DIR}/namespaces/projects.err" false get projects -o wide
+
+    # Create a clean file with just the namespace names
+    oc get namespaces -o name | sed 's|namespace/||' > "${OUTPUT_DIR}/namespaces/namespace_list.txt"
+
+    # Loop through each namespace from the file
+    while IFS= read -r NS; do
+        log "  [NAMESPACE] Collecting for $NS..."
+        mkdir -p "${OUTPUT_DIR}/namespaces/${NS}"
+
+        (
+            run_oc "${OUTPUT_DIR}/namespaces/${NS}/all_resources.txt" "${OUTPUT_DIR}/namespaces/${NS}/all_resources.err" false get all -n ${NS} -o wide
+            run_oc "${OUTPUT_DIR}/namespaces/${NS}/pods.yaml" "${OUTPUT_DIR}/namespaces/${NS}/pods.err" false get pods -n ${NS} -o yaml
+            run_oc "${OUTPUT_DIR}/namespaces/${NS}/deployments.yaml" "${OUTPUT_DIR}/namespaces/${NS}/deployments.err" false get deployments -n ${NS} -o yaml
+            run_oc "${OUTPUT_DIR}/namespaces/${NS}/configmaps.yaml" "${OUTPUT_DIR}/namespaces/${NS}/configmaps.err" false get configmap -n ${NS} -o yaml
+            run_oc "${OUTPUT_DIR}/namespaces/${NS}/secrets_redacted.yaml" "${OUTPUT_DIR}/namespaces/${NS}/secrets_redacted.err" false get secret -n ${NS} -o yaml | grep -v 'data:'
+        ) &
+        if (( $(jobs -r -p | wc -l) >= PARALLEL_JOBS )); then wait; fi
+    done < "${OUTPUT_DIR}/namespaces/namespace_list.txt"
+
+    wait
+    log "[DONE] Namespace collection complete."
+}
+
+collect_namespace_resources() {
+    log "[PROGRESS] Collecting namespace-scoped resources..."
+    mkdir -p "${OUTPUT_DIR}/namespace_resources"
+
+    # Use the same clean namespace list we created in collect_namespaces
+    if [[ -f "${OUTPUT_DIR}/namespaces/namespace_list.txt" ]]; then
+        log "  [INFO] Using existing namespace list"
+    else
+        log "  [INFO] Creating namespace list"
+        # Create it if it doesn't exist (in case this function is called directly)
+        oc get namespaces -o name | sed 's|namespace/||' > "${OUTPUT_DIR}/namespaces/namespace_list.txt"
+    fi
+
+    # Loop through namespaces from the file
+    while IFS= read -r NS; do
+        if [[ -n "$NS" ]]; then
+            log "  [NAMESPACE] Collecting resources for $NS..."
+            mkdir -p "${OUTPUT_DIR}/namespace_resources/${NS}"
+
+            (
+                # Key namespace-scoped resources
+                run_oc "${OUTPUT_DIR}/namespace_resources/${NS}/resourcequotas.yaml" "${OUTPUT_DIR}/namespace_resources/${NS}/resourcequotas.err" false get resourcequotas -n ${NS} -o yaml
+                run_oc "${OUTPUT_DIR}/namespace_resources/${NS}/limitranges.yaml" "${OUTPUT_DIR}/namespace_resources/${NS}/limitranges.err" false get limitranges -n ${NS} -o yaml
+                run_oc "${OUTPUT_DIR}/namespace_resources/${NS}/pdb.yaml" "${OUTPUT_DIR}/namespace_resources/${NS}/pdb.err" false get pdb -n ${NS} -o yaml
+                run_oc "${OUTPUT_DIR}/namespace_resources/${NS}/networkpolicies.yaml" "${OUTPUT_DIR}/namespace_resources/${NS}/networkpolicies.err" false get networkpolicies -n ${NS} -o yaml
+                run_oc "${OUTPUT_DIR}/namespace_resources/${NS}/ingresses.yaml" "${OUTPUT_DIR}/namespace_resources/${NS}/ingresses.err" false get ingresses -n ${NS} -o yaml
+                run_oc "${OUTPUT_DIR}/namespace_resources/${NS}/routes.yaml" "${OUTPUT_DIR}/namespace_resources/${NS}/routes.err" false get routes -n ${NS} -o yaml
+                run_oc "${OUTPUT_DIR}/namespace_resources/${NS}/serviceaccounts.yaml" "${OUTPUT_DIR}/namespace_resources/${NS}/serviceaccounts.err" false get serviceaccounts -n ${NS} -o yaml
+                run_oc "${OUTPUT_DIR}/namespace_resources/${NS}/imagestreams.yaml" "${OUTPUT_DIR}/namespace_resources/${NS}/imagestreams.err" false get imagestreams -n ${NS} -o yaml
+                run_oc "${OUTPUT_DIR}/namespace_resources/${NS}/events.yaml" "${OUTPUT_DIR}/namespace_resources/${NS}/events.err" false get events -n ${NS} -o yaml
+                run_oc "${OUTPUT_DIR}/namespace_resources/${NS}/buildconfigs.yaml" "${OUTPUT_DIR}/namespace_resources/${NS}/buildconfigs.err" false get buildconfigs -n ${NS} -o yaml
+                run_oc "${OUTPUT_DIR}/namespace_resources/${NS}/builds.yaml" "${OUTPUT_DIR}/namespace_resources/${NS}/builds.err" false get builds -n ${NS} -o yaml
+                run_oc "${OUTPUT_DIR}/namespace_resources/${NS}/cronjobs.yaml" "${OUTPUT_DIR}/namespace_resources/${NS}/cronjobs.err" false get cronjobs -n ${NS} -o yaml
+                run_oc "${OUTPUT_DIR}/namespace_resources/${NS}/jobs.yaml" "${OUTPUT_DIR}/namespace_resources/${NS}/jobs.err" false get jobs -n ${NS} -o yaml
+                run_oc "${OUTPUT_DIR}/namespace_resources/${NS}/hpa.yaml" "${OUTPUT_DIR}/namespace_resources/${NS}/hpa.err" false get hpa -n ${NS} -o yaml
+
+                # Additional resources to collect
+                run_oc "${OUTPUT_DIR}/namespace_resources/${NS}/services.yaml" "${OUTPUT_DIR}/namespace_resources/${NS}/services.err" false get services -n ${NS} -o yaml
+                run_oc "${OUTPUT_DIR}/namespace_resources/${NS}/persistentvolumeclaims.yaml" "${OUTPUT_DIR}/namespace_resources/${NS}/persistentvolumeclaims.err" false get persistentvolumeclaims -n ${NS} -o yaml
+            ) &
+
+            if (( $(jobs -r -p | wc -l) >= PARALLEL_JOBS )); then wait; fi
+        else
+            log "  [WARN] Skipping resource collection: empty namespace"
+        fi
+    done < "${OUTPUT_DIR}/namespaces/namespace_list.txt"
+
+    wait
+    log "[DONE] Namespace-scoped resource collection complete."
+}
+
+collect_cluster_resources() {
+    log "[PROGRESS] Collecting cluster-wide resources..."
+    mkdir -p "${OUTPUT_DIR}/cluster_resources"
+    run_oc "${OUTPUT_DIR}/cluster_resources/clusterroles.yaml" "${OUTPUT_DIR}/cluster_resources/clusterroles.err" false get clusterroles -o yaml
+    run_oc "${OUTPUT_DIR}/cluster_resources/clusterrolebindings.yaml" "${OUTPUT_DIR}/cluster_resources/clusterrolebindings.err" false get clusterrolebindings -o yaml
+    run_oc "${OUTPUT_DIR}/cluster_resources/crds.yaml" "${OUTPUT_DIR}/cluster_resources/crds.err" false get crd -o yaml
+    run_oc "${OUTPUT_DIR}/cluster_resources/apiservices.yaml" "${OUTPUT_DIR}/cluster_resources/apiservices.err" false get apiservices -o yaml
+    run_oc "${OUTPUT_DIR}/cluster_resources/persistentvolumes.yaml" "${OUTPUT_DIR}/cluster_resources/persistentvolumes.err" false get pv -o yaml
+    run_oc "${OUTPUT_DIR}/cluster_resources/storageclasses.yaml" "${OUTPUT_DIR}/cluster_resources/storageclasses.err" false get storageclass -o yaml
+    run_oc "${OUTPUT_DIR}/cluster_resources/componentstatuses.yaml" "${OUTPUT_DIR}/cluster_resources/componentstatuses.err" false get componentstatuses -o yaml
+    run_oc "${OUTPUT_DIR}/cluster_resources/machineconfigpools.yaml" "${OUTPUT_DIR}/cluster_resources/machineconfigpools.err" false get machineconfigpools -o yaml
+    run_oc "${OUTPUT_DIR}/cluster_resources/imagepruner.yaml" "${OUTPUT_DIR}/cluster_resources/imagepruner.err" true get imagepruner -o yaml
+    run_oc "${OUTPUT_DIR}/cluster_resources/clusterautoscaler.yaml" "${OUTPUT_DIR}/cluster_resources/clusterautoscaler.err" true get clusterautoscaler -o yaml
+    run_oc "${OUTPUT_DIR}/cluster_resources/clusterversion.yaml" "${OUTPUT_DIR}/cluster_resources/clusterversion.err" false get clusterversion -o yaml
+    log "[DONE] Cluster-wide resources collected."
+}
+
+# --- Additional Suggested Collection Functions ---
+collect_audit_logs() {
+    log "[PROGRESS] Collecting audit logs..."
+    mkdir -p "${OUTPUT_DIR}/audit"
+    run_oc "${OUTPUT_DIR}/audit/kube-apiserver-audit.log" "${OUTPUT_DIR}/audit/kube-apiserver-audit.err" false adm node-logs --role=master -u kube-apiserver
+    log "[DONE] Audit logs collected."
+}
+
+collect_rbac() {
+    log "[PROGRESS] Collecting RBAC resources..."
+    mkdir -p "${OUTPUT_DIR}/rbac"
+    run_oc "${OUTPUT_DIR}/rbac/users.yaml" "${OUTPUT_DIR}/rbac/users.err" false get users -o yaml
+    run_oc "${OUTPUT_DIR}/rbac/groups.yaml" "${OUTPUT_DIR}/rbac/groups.err" false get groups -o yaml
+    run_oc "${OUTPUT_DIR}/rbac/clusterroles.yaml" "${OUTPUT_DIR}/rbac/clusterroles.err" false get clusterroles -o yaml
+    run_oc "${OUTPUT_DIR}/rbac/clusterrolebindings.yaml" "${OUTPUT_DIR}/rbac/clusterrolebindings.err" false get clusterrolebindings -o yaml
+    run_oc "${OUTPUT_DIR}/rbac/roles.yaml" "${OUTPUT_DIR}/rbac/roles.err" false get roles --all-namespaces -o yaml
+    run_oc "${OUTPUT_DIR}/rbac/rolebindings.yaml" "${OUTPUT_DIR}/rbac/rolebindings.err" false get rolebindings --all-namespaces -o yaml
+    log "[DONE] RBAC resources collected."
+}
+
+collect_crd_instances() {
+    log "[PROGRESS] Collecting CRD instances..."
+    mkdir -p "${OUTPUT_DIR}/crd_instances"
+    run_oc "${OUTPUT_DIR}/crd_instances/crds.txt" "${OUTPUT_DIR}/crd_instances/crds.err" false get crds -o name | while read -r crd; do
+        crd_name=$(echo $crd | cut -d'/' -f2)
+        log "  [CRD] Collecting $crd_name..."
+        run_oc "${OUTPUT_DIR}/crd_instances/${crd_name}.yaml" "${OUTPUT_DIR}/crd_instances/${crd_name}.err" false get $crd -o yaml
+    done
+    log "[DONE] CRD instances collected."
+}
+
+collect_storage() {
+    log "[PROGRESS] Collecting storage resources..."
+    mkdir -p "${OUTPUT_DIR}/storage"
+    run_oc "${OUTPUT_DIR}/storage/persistent_volumes.yaml" "${OUTPUT_DIR}/storage/persistent_volumes.err" false get pv -o yaml
+    run_oc "${OUTPUT_DIR}/storage/persistent_volume_claims.yaml" "${OUTPUT_DIR}/storage/persistent_volume_claims.err" false get pvc --all-namespaces -o yaml
+    run_oc "${OUTPUT_DIR}/storage/storage_classes.yaml" "${OUTPUT_DIR}/storage/storage_classes.err" false get storageclass -o yaml
+    log "[DONE] Storage resources collected."
+}
+
+collect_events() {
+    log "[PROGRESS] Collecting cluster events..."
+    mkdir -p "${OUTPUT_DIR}/events"
+    run_oc "${OUTPUT_DIR}/events/events.yaml" "${OUTPUT_DIR}/events/events.err" false get events --all-namespaces -o yaml
+    log "[DONE] Cluster events collected."
+}
+
+collect_imagestreams_buildconfigs() {
+    log "[PROGRESS] Collecting ImageStreams and BuildConfigs..."
+    mkdir -p "${OUTPUT_DIR}/builds"
+    run_oc "${OUTPUT_DIR}/builds/imagestreams.yaml" "${OUTPUT_DIR}/builds/imagestreams.err" false get imagestreams --all-namespaces -o yaml
+    run_oc "${OUTPUT_DIR}/builds/buildconfigs.yaml" "${OUTPUT_DIR}/builds/buildconfigs.err" false get buildconfigs --all-namespaces -o yaml
+    log "[DONE] ImageStreams and BuildConfigs collected."
+}
+
+collect_machine_api() {
+    log "[PROGRESS] Collecting Machine API resources..."
+    mkdir -p "${OUTPUT_DIR}/machine_api"
+    run_oc "${OUTPUT_DIR}/machine_api/machinesets.yaml" "${OUTPUT_DIR}/machine_api/machinesets.err" false get machinesets -A -o yaml
+    run_oc "${OUTPUT_DIR}/machine_api/machineconfigs.yaml" "${OUTPUT_DIR}/machine_api/machineconfigs.err" false get machineconfigs -A -o yaml
+    log "[DONE] Machine API resources collected."
+}
+
+collect_api_resources() {
+    log "[PROGRESS] Collecting API resources..."
+    run_oc "${OUTPUT_DIR}/api_resources.txt" "${OUTPUT_DIR}/api_resources.err" false api-resources
+    log "[DONE] API resources collected."
+}
+
+collect_autoscalers() {
+    log "[PROGRESS] Collecting autoscalers..."
+    mkdir -p "${OUTPUT_DIR}/autoscalers"
+    run_oc "${OUTPUT_DIR}/autoscalers/clusterautoscaler.yaml" "${OUTPUT_DIR}/autoscalers/clusterautoscaler.err" true get clusterautoscaler -o yaml
+    run_oc "${OUTPUT_DIR}/autoscalers/hpa.yaml" "${OUTPUT_DIR}/autoscalers/hpa.err" false get hpa --all-namespaces -o yaml
+    run_oc "${OUTPUT_DIR}/autoscalers/vpa.yaml" "${OUTPUT_DIR}/autoscalers/vpa.err" true get vpa --all-namespaces -o yaml
+    log "[DONE] Autoscalers collected."
+}
+
+collect_clusterversion_history() {
+    log "[PROGRESS] Collecting cluster version history..."
+    mkdir -p "${OUTPUT_DIR}/version"
+
+    # First get the raw clusterversion data
+    run_oc "${OUTPUT_DIR}/version/clusterversion.json" "${OUTPUT_DIR}/version/clusterversion.err" false get clusterversion -o json
+
+    # Then process it with jq safely
+    if [[ -s "${OUTPUT_DIR}/version/clusterversion.json" ]]; then
+        # Extract just the history portion
+        if command -v jq &>/dev/null; then
+            jq '.items[0].status.history' "${OUTPUT_DIR}/version/clusterversion.json" > "${OUTPUT_DIR}/version/history.json" 2> "${OUTPUT_DIR}/version/jq.err"
+
+            # If jq failed, log an error
+            if [[ ! -s "${OUTPUT_DIR}/version/history.json" ]]; then
+                log "  [ERROR] Failed to parse version history with jq"
+                echo "JQ parsing error - see jq.err for details" > "${OUTPUT_DIR}/version/history.json"
+            else
+                # Create a more human-readable version
+                jq -r '.[] | "Version: \(.version) - State: \(.state) - Started: \(.startedTime)"' "${OUTPUT_DIR}/version/history.json" > "${OUTPUT_DIR}/version/history.txt" 2>> "${OUTPUT_DIR}/version/jq.err"
+            fi
+        else
+            log "  [WARN] jq not available, skipping version history parsing"
+            echo "JQ not installed - install jq to parse version history" > "${OUTPUT_DIR}/version/history.json"
+        fi
+    else
+        log "  [ERROR] Failed to get cluster version data"
+    fi
+
+    log "[DONE] Cluster version history collected."
+}
+
+# --- HTML Generation Functions (Bootstrap 5 + PrismJS) ---
+
+# Helper to escape HTML characters
+escape_html() {
+    sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g; s/"/\&quot;/g; s/'"'"'/\&#39;/g'
+}
+
+generate_html_header() {
+    local title="$1"
+    local current_page_id="$2" # e.g., "dashboard", "nodes_index", etc.
+    cat <<EOF
 <!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Cluster Dashboard - OpenShift Cluster Report</title>
+  <title>${title} - OpenShift Cluster Report</title>
   <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet">
   <link href="https://cdn.datatables.net/1.13.7/css/dataTables.bootstrap5.min.css" rel="stylesheet">
   <link href="https://cdn.datatables.net/responsive/2.5.0/css/responsive.bootstrap5.min.css" rel="stylesheet">
@@ -222,32 +799,32 @@
       <span class="input-group-text"><i class="fas fa-search"></i></span>
     </div>
     <ul class="nav flex-column">
-      <li class="nav-item"><a class="nav-link active" href="index.html"><i class="fas fa-tachometer-alt fa-fw me-2"></i>Dashboard</a></li>
+      <li class="nav-item"><a class="nav-link $([[ "$current_page_id" == "dashboard" ]] && echo 'active')" href="index.html"><i class="fas fa-tachometer-alt fa-fw me-2"></i>Dashboard</a></li>
       <li class="nav-header">Cluster Core</li>
-      <li class="nav-item"><a class="nav-link " href="basic_index.html"><i class="fas fa-info-circle fa-fw me-2"></i>Basic Info</a></li>
-      <li class="nav-item"><a class="nav-link " href="clusterversion_history_index.html"><i class="fas fa-history fa-fw me-2"></i>Version History</a></li>
-      <li class="nav-item"><a class="nav-link " href="nodes_index.html"><i class="fas fa-server fa-fw me-2"></i>Nodes</a></li>
-      <li class="nav-item"><a class="nav-link " href="operators_index.html"><i class="fas fa-cogs fa-fw me-2"></i>Operators</a></li>
-      <li class="nav-item"><a class="nav-link " href="etcd_index.html"><i class="fas fa-database fa-fw me-2"></i>etcd</a></li>
-      <li class="nav-item"><a class="nav-link " href="api_resources_index.html"><i class="fas fa-stream fa-fw me-2"></i>API Resources</a></li>
+      <li class="nav-item"><a class="nav-link $([[ "$current_page_id" == "basic_index" ]] && echo 'active')" href="basic_index.html"><i class="fas fa-info-circle fa-fw me-2"></i>Basic Info</a></li>
+      <li class="nav-item"><a class="nav-link $([[ "$current_page_id" == "clusterversion_history_index" ]] && echo 'active')" href="clusterversion_history_index.html"><i class="fas fa-history fa-fw me-2"></i>Version History</a></li>
+      <li class="nav-item"><a class="nav-link $([[ "$current_page_id" == "nodes_index" ]] && echo 'active')" href="nodes_index.html"><i class="fas fa-server fa-fw me-2"></i>Nodes</a></li>
+      <li class="nav-item"><a class="nav-link $([[ "$current_page_id" == "operators_index" ]] && echo 'active')" href="operators_index.html"><i class="fas fa-cogs fa-fw me-2"></i>Operators</a></li>
+      <li class="nav-item"><a class="nav-link $([[ "$current_page_id" == "etcd_index" ]] && echo 'active')" href="etcd_index.html"><i class="fas fa-database fa-fw me-2"></i>etcd</a></li>
+      <li class="nav-item"><a class="nav-link $([[ "$current_page_id" == "api_resources_index" ]] && echo 'active')" href="api_resources_index.html"><i class="fas fa-stream fa-fw me-2"></i>API Resources</a></li>
       <li class="nav-header">Workloads & Config</li>
-      <li class="nav-item"><a class="nav-link " href="namespaces_index.html"><i class="fas fa-project-diagram fa-fw me-2"></i>Namespaces</a></li>
-      <li class="nav-item"><a class="nav-link " href="namespace_resources_index.html"><i class="fas fa-boxes fa-fw me-2"></i>Namespace Details</a></li>
-      <li class="nav-item"><a class="nav-link " href="cluster_resources_index.html"><i class="fas fa-globe fa-fw me-2"></i>Cluster Resources</a></li>
-      <li class="nav-item"><a class="nav-link " href="crd_instances_index.html"><i class="fas fa-puzzle-piece fa-fw me-2"></i>CRD Instances</a></li>
-      <li class="nav-item"><a class="nav-link " href="builds_index.html"><i class="fas fa-images fa-fw me-2"></i>Builds & Images</a></li>
+      <li class="nav-item"><a class="nav-link $([[ "$current_page_id" == "namespaces_index" ]] && echo 'active')" href="namespaces_index.html"><i class="fas fa-project-diagram fa-fw me-2"></i>Namespaces</a></li>
+      <li class="nav-item"><a class="nav-link $([[ "$current_page_id" == "namespace_resources_index" ]] && echo 'active')" href="namespace_resources_index.html"><i class="fas fa-boxes fa-fw me-2"></i>Namespace Details</a></li>
+      <li class="nav-item"><a class="nav-link $([[ "$current_page_id" == "cluster_resources_index" ]] && echo 'active')" href="cluster_resources_index.html"><i class="fas fa-globe fa-fw me-2"></i>Cluster Resources</a></li>
+      <li class="nav-item"><a class="nav-link $([[ "$current_page_id" == "crd_instances_index" ]] && echo 'active')" href="crd_instances_index.html"><i class="fas fa-puzzle-piece fa-fw me-2"></i>CRD Instances</a></li>
+      <li class="nav-item"><a class="nav-link $([[ "$current_page_id" == "builds_index" ]] && echo 'active')" href="builds_index.html"><i class="fas fa-images fa-fw me-2"></i>Builds & Images</a></li>
       <li class="nav-header">Infrastructure</li>
-      <li class="nav-item"><a class="nav-link " href="network_index.html"><i class="fas fa-network-wired fa-fw me-2"></i>Networking</a></li>
-      <li class="nav-item"><a class="nav-link " href="storage_index.html"><i class="fas fa-hdd fa-fw me-2"></i>Storage</a></li>
-      <li class="nav-item"><a class="nav-link " href="machine_api_index.html"><i class="fas fa-robot fa-fw me-2"></i>Machine API</a></li>
+      <li class="nav-item"><a class="nav-link $([[ "$current_page_id" == "network_index" ]] && echo 'active')" href="network_index.html"><i class="fas fa-network-wired fa-fw me-2"></i>Networking</a></li>
+      <li class="nav-item"><a class="nav-link $([[ "$current_page_id" == "storage_index" ]] && echo 'active')" href="storage_index.html"><i class="fas fa-hdd fa-fw me-2"></i>Storage</a></li>
+      <li class="nav-item"><a class="nav-link $([[ "$current_page_id" == "machine_api_index" ]] && echo 'active')" href="machine_api_index.html"><i class="fas fa-robot fa-fw me-2"></i>Machine API</a></li>
       <li class="nav-header">Operations</li>
-      <li class="nav-item"><a class="nav-link " href="security_index.html"><i class="fas fa-shield-alt fa-fw me-2"></i>Security</a></li>
-      <li class="nav-item"><a class="nav-link " href="rbac_index.html"><i class="fas fa-users-cog fa-fw me-2"></i>RBAC</a></li>
-      <li class="nav-item"><a class="nav-link " href="metrics_index.html"><i class="fas fa-chart-line fa-fw me-2"></i>Metrics</a></li>
-      <li class="nav-item"><a class="nav-link " href="autoscalers_index.html"><i class="fas fa-arrows-alt-h fa-fw me-2"></i>Autoscalers</a></li>
-      <li class="nav-item"><a class="nav-link " href="events_index.html"><i class="fas fa-bell fa-fw me-2"></i>Events</a></li>
-      <li class="nav-item"><a class="nav-link " href="logs_index.html"><i class="fas fa-file-alt fa-fw me-2"></i>Logs</a></li>
-      <li class="nav-item"><a class="nav-link " href="audit_index.html"><i class="fas fa-user-secret fa-fw me-2"></i>Audit Config</a></li>
+      <li class="nav-item"><a class="nav-link $([[ "$current_page_id" == "security_index" ]] && echo 'active')" href="security_index.html"><i class="fas fa-shield-alt fa-fw me-2"></i>Security</a></li>
+      <li class="nav-item"><a class="nav-link $([[ "$current_page_id" == "rbac_index" ]] && echo 'active')" href="rbac_index.html"><i class="fas fa-users-cog fa-fw me-2"></i>RBAC</a></li>
+      <li class="nav-item"><a class="nav-link $([[ "$current_page_id" == "metrics_index" ]] && echo 'active')" href="metrics_index.html"><i class="fas fa-chart-line fa-fw me-2"></i>Metrics</a></li>
+      <li class="nav-item"><a class="nav-link $([[ "$current_page_id" == "autoscalers_index" ]] && echo 'active')" href="autoscalers_index.html"><i class="fas fa-arrows-alt-h fa-fw me-2"></i>Autoscalers</a></li>
+      <li class="nav-item"><a class="nav-link $([[ "$current_page_id" == "events_index" ]] && echo 'active')" href="events_index.html"><i class="fas fa-bell fa-fw me-2"></i>Events</a></li>
+      <li class="nav-item"><a class="nav-link $([[ "$current_page_id" == "logs_index" ]] && echo 'active')" href="logs_index.html"><i class="fas fa-file-alt fa-fw me-2"></i>Logs</a></li>
+      <li class="nav-item"><a class="nav-link $([[ "$current_page_id" == "audit_index" ]] && echo 'active')" href="audit_index.html"><i class="fas fa-user-secret fa-fw me-2"></i>Audit Config</a></li>
     </ul>
   </nav>
   <main class="main-content" id="content">
@@ -261,42 +838,11 @@
         <!-- Search results will appear here -->
       </div>
     </div>
-<div class="row row-cols-1 row-cols-md-3 g-4 mb-4">
-</div>
-<!-- Quick Links Section -->
-<div class="card mb-4 shadow-sm">
-  <div class="card-header card-header-accent">
-    <i class="fas fa-link me-2"></i>Quick Access
-  </div>
-  <div class="card-body">
-    <div class="row">
-      <div class="col-md-4 mb-3">
-        <h6><i class="fas fa-server me-2 text-success"></i>Infrastructure</h6>
-        <ul class="list-unstyled ms-3">
-          <li><a href="nodes_table.html">Nodes</a></li>
-          <li><a href="infrastructure.yaml.html">Cluster Infrastructure</a></li>
-          <li><a href="machine_api_index.html">Machine API</a></li>
-        </ul>
-      </div>
-      <div class="col-md-4 mb-3">
-        <h6><i class="fas fa-shield-alt me-2 text-danger"></i>Security & Access</h6>
-        <ul class="list-unstyled ms-3">
-          <li><a href="rbac_index.html">RBAC Configuration</a></li>
-          <li><a href="security_index.html">Security Context Constraints</a></li>
-          <li><a href="security/oauth.yaml.html">Authentication</a></li>
-        </ul>
-      </div>
-      <div class="col-md-4 mb-3">
-        <h6><i class="fas fa-network-wired me-2 text-primary"></i>Network & Storage</h6>
-        <ul class="list-unstyled ms-3">
-          <li><a href="network_index.html">Network Configuration</a></li>
-          <li><a href="storage_index.html">Storage Resources</a></li>
-          <li><a href="network/network_config.yaml.html">Cluster Network</a></li>
-        </ul>
-      </div>
-    </div>
-  </div>
-</div>
+EOF
+}
+
+generate_html_footer() {
+    cat <<EOF
   </main>
 </div>
 <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/js/bootstrap.bundle.min.js"></script>
@@ -316,9 +862,9 @@
 <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/plugins/autoloader/prism-autoloader.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/plugins/line-numbers/prism-line-numbers.min.js"></script>
 <script>
-  $(document).ready(function() {
+  \$(document).ready(function() {
     // Initialize DataTables with improved features
-    var dataTable = $('table.datatable').DataTable({
+    var dataTable = \$('table.datatable').DataTable({
       responsive: true,
       dom: 'Bfrtip',
       buttons: [
@@ -356,48 +902,48 @@
     });
 
     // Sidebar toggle functionality for responsive design
-    $('#sidebarToggle').on('click', function() {
-      $('#sidebar').toggleClass('active');
-      $('#content').toggleClass('sidebar-active');
+    \$('#sidebarToggle').on('click', function() {
+      \$('#sidebar').toggleClass('active');
+      \$('#content').toggleClass('sidebar-active');
     });
 
     // Sidebar menu filter
-    $('#sidebarSearch').on('keyup', function() {
-      var value = $(this).val().toLowerCase();
-      $('.sidebar .nav-item:not(:first-child)').filter(function() {
-        var matches = $(this).text().toLowerCase().indexOf(value) > -1;
-        $(this).toggle(matches);
+    \$('#sidebarSearch').on('keyup', function() {
+      var value = \$(this).val().toLowerCase();
+      \$('.sidebar .nav-item:not(:first-child)').filter(function() {
+        var matches = \$(this).text().toLowerCase().indexOf(value) > -1;
+        \$(this).toggle(matches);
       });
 
       // Hide/show section headers based on if their items are visible
-      $('.sidebar .nav-header').each(function() {
-        var header = $(this);
+      \$('.sidebar .nav-header').each(function() {
+        var header = \$(this);
         var hasVisibleItems = header.nextUntil('.nav-header').filter(':visible').length > 0;
         header.toggle(hasVisibleItems);
       });
     });
 
     // Global search functionality
-    $('#globalSearchBtn').on('click', function() {
+    \$('#globalSearchBtn').on('click', function() {
       performGlobalSearch();
     });
 
-    $('#globalSearch').on('keypress', function(e) {
+    \$('#globalSearch').on('keypress', function(e) {
       if (e.which == 13) {
         performGlobalSearch();
       }
     });
 
     function performGlobalSearch() {
-      var query = $('#globalSearch').val().trim().toLowerCase();
+      var query = \$('#globalSearch').val().trim().toLowerCase();
       if (query.length < 2) return;
 
-      $('#searchResults').removeClass('d-none').html(
+      \$('#searchResults').removeClass('d-none').html(
         '<div class="d-flex justify-content-center"><div class="spinner-border text-primary" role="status"><span class="visually-hidden">Searching...</span></div></div>'
       );
 
       // Load the search index and perform the search
-      $.ajax({
+      \$.ajax({
         url: 'search_index.json',
         dataType: 'json',
         success: function(data) {
@@ -443,28 +989,28 @@
             resultsHtml = '<div class="alert alert-warning">No results found for "' + query + '"</div>';
           }
 
-          $('#searchResults').html(resultsHtml);
+          \$('#searchResults').html(resultsHtml);
         },
         error: function() {
-          $('#searchResults').html('<div class="alert alert-danger">Error loading search index. Please try again.</div>');
+          \$('#searchResults').html('<div class="alert alert-danger">Error loading search index. Please try again.</div>');
         }
       });
     }
 
     // Add clipboard copy functionality to code blocks
-    $('pre code').each(function() {
-      var codeBlock = $(this);
+    \$('pre code').each(function() {
+      var codeBlock = \$(this);
       var pre = codeBlock.parent();
 
       // Only add if not already added
       if (pre.parent('.code-toolbar').length === 0) {
-        var toolbar = $('<div class="code-header"><span>' + (pre.data('filename') || 'Code') + '</span><button class="btn btn-sm btn-dark copy-button"><i class="fas fa-copy"></i></button></div>');
+        var toolbar = \$('<div class="code-header"><span>' + (pre.data('filename') || 'Code') + '</span><button class="btn btn-sm btn-dark copy-button"><i class="fas fa-copy"></i></button></div>');
         pre.before(toolbar);
 
         toolbar.find('.copy-button').on('click', function() {
           var text = codeBlock.text();
           navigator.clipboard.writeText(text).then(function() {
-            var button = $(this);
+            var button = \$(this);
             button.html('<i class="fas fa-check"></i>');
             setTimeout(function() {
               button.html('<i class="fas fa-copy"></i>');
@@ -477,3 +1023,921 @@
 </script>
 </body>
 </html>
+EOF
+}
+
+# Generate a DataTable HTML page from a tabular file (space/tab delimited)
+generate_datatable_page() {
+    local title="$1"
+    local data_file="$2"
+    local output_html="$3"
+    local category="$4"
+    local link_config="${5:-}" # Format: "column_index,detail_suffix"
+
+    local column_index=0
+    local detail_suffix=""
+
+    if [[ -n "$link_config" ]]; then
+      column_index=$(echo "$link_config" | cut -d',' -f1)
+      detail_suffix=$(echo "$link_config" | cut -d',' -f2)
+    fi
+
+    generate_html_header "$title" "${category}_index" > "$output_html"
+
+    # Add breadcrumb navigation
+    echo '<nav aria-label="breadcrumb">' >> "$output_html"
+    echo '  <ol class="breadcrumb">' >> "$output_html"
+    echo '    <li class="breadcrumb-item"><a href="index.html">Dashboard</a></li>' >> "$output_html"
+    if [[ -n "$category" ]]; then
+      echo '    <li class="breadcrumb-item"><a href="'"${category}_index.html"'">'${CATEGORIES[$category]}'</a></li>' >> "$output_html"
+    fi
+    echo '    <li class="breadcrumb-item active" aria-current="page">'$title'</li>' >> "$output_html"
+    echo '  </ol>' >> "$output_html"
+    echo '</nav>' >> "$output_html"
+
+    echo '<div class="card">' >> "$output_html"
+    echo '<div class="card-header card-header-accent">' >> "$output_html"
+    echo '<i class="fas fa-table me-2"></i>'$title'</span>' >> "$output_html"
+    echo '</div>' >> "$output_html"
+    echo '<div class="card-body">' >> "$output_html"
+
+    echo '<div class="table-responsive">' >> "$output_html"
+    echo '<table class="table table-striped table-hover datatable" id="datatable-'$(echo "$title" | tr ' ' '-' | tr '[:upper:]' '[:lower:]')'">' >> "$output_html"
+
+    # Process the header - use awk to get the header columns
+    local header_line=$(head -n 1 "$data_file")
+    local header_count=$(echo "$header_line" | awk '{print NF}')
+    echo '<thead><tr>' >> "$output_html"
+
+    # Extract and output each header column
+    for ((i=1; i<=header_count; i++)); do
+      local header_field=$(echo "$header_line" | awk -v col=$i '{print $col}')
+      echo '<th>'$header_field'</th>' >> "$output_html"
+    done
+    echo '</tr></thead><tbody>' >> "$output_html"
+
+    # Process data rows - use awk to handle fields with spaces
+    tail -n +2 "$data_file" | grep -v '^[[:space:]]*$' | while read -r line; do
+      echo '<tr>' >> "$output_html"
+
+      # For OS-IMAGE and similar fields that contain spaces, we need special handling
+      # First, handle the special case for nodes_wide.txt which has OS-IMAGE field
+      if [[ "$data_file" == *"nodes_wide.txt" ]]; then
+        # Extract fields carefully for nodes data
+        local name=$(echo "$line" | awk '{print $1}')
+        local status=$(echo "$line" | awk '{print $2}')
+        local roles=$(echo "$line" | awk '{print $3}')
+        local age=$(echo "$line" | awk '{print $4}')
+        local version=$(echo "$line" | awk '{print $5}')
+        local internal_ip=$(echo "$line" | awk '{print $6}')
+        local external_ip=$(echo "$line" | awk '{print $7}')
+
+        # OS-IMAGE might contain spaces, extract it carefully
+        # It's between EXTERNAL-IP and KERNEL-VERSION
+        local os_image=$(echo "$line" | awk '{for(i=8;i<NF-1;i++) printf "%s ", $i; print $(NF-1)}')
+
+        # Last field is CONTAINER-RUNTIME
+        local kernel_version=$(echo "$line" | awk '{print $(NF-1)}')
+        local container_runtime=$(echo "$line" | awk '{print $NF}')
+
+        # Output each field with proper handling
+        if [[ "$column_index" -eq 1 && -n "$detail_suffix" ]]; then
+          # Verify that the target file exists or will be generated
+          local source_file="${OUTPUT_DIR}/${category}/${name}${detail_suffix}"
+          local html_file="${source_file}.html"
+
+          # If the source file exists but the HTML doesn't, generate it now
+          if [[ -f "$source_file" && ! -f "$html_file" ]]; then
+            log "  [INFO] Pre-generating HTML for linked node file: $source_file"
+            generate_detail_page "$(basename "$source_file")" "$source_file" "$html_file" "text" "$category"
+          fi
+
+          echo '<td><a href="'$name$detail_suffix'.html">'$name'</a></td>' >> "$output_html"
+        else
+          echo '<td>'$name'</td>' >> "$output_html"
+        fi
+
+        # Status with indicator
+        case "$status" in
+          Ready)
+            echo '<td><span class="status-indicator status-good"></span>'$status'</td>' >> "$output_html"
+            ;;
+          NotReady)
+            echo '<td><span class="status-indicator status-error"></span>'$status'</td>' >> "$output_html"
+            ;;
+          *)
+            echo '<td>'$status'</td>' >> "$output_html"
+            ;;
+        esac
+
+        # Remaining fields
+        echo '<td>'$roles'</td>' >> "$output_html"
+        echo '<td>'$age'</td>' >> "$output_html"
+        echo '<td>'$version'</td>' >> "$output_html"
+        echo '<td>'$internal_ip'</td>' >> "$output_html"
+        echo '<td>'$external_ip'</td>' >> "$output_html"
+        echo '<td>'$os_image'</td>' >> "$output_html"
+        echo '<td>'$kernel_version'</td>' >> "$output_html"
+        echo '<td>'$container_runtime'</td>' >> "$output_html"
+
+      # Special case for clusteroperators.txt which has MESSAGE field that might be empty
+      elif [[ "$data_file" == *"clusteroperators.txt" ]]; then
+        # Extract fields for operators data
+        local name=$(echo "$line" | awk '{print $1}')
+        local version=$(echo "$line" | awk '{print $2}')
+        local available=$(echo "$line" | awk '{print $3}')
+        local progressing=$(echo "$line" | awk '{print $4}')
+        local degraded=$(echo "$line" | awk '{print $5}')
+        local since=$(echo "$line" | awk '{print $6}')
+        local message=$(echo "$line" | awk '{for(i=7;i<=NF;i++) printf "%s ", $i}')
+
+        # Output each field with proper handling
+        if [[ "$column_index" -eq 1 && -n "$detail_suffix" ]]; then
+          # Verify that the target file exists or will be generated
+          local source_file="${OUTPUT_DIR}/${category}/${name}${detail_suffix}"
+          local html_file="${source_file}.html"
+
+          # If the source file exists but the HTML doesn't, generate it now
+          if [[ -f "$source_file" && ! -f "$html_file" ]]; then
+            log "  [INFO] Pre-generating HTML for linked operator file: $source_file"
+            generate_detail_page "$(basename "$source_file")" "$source_file" "$html_file" "text" "$category"
+          fi
+
+          echo '<td><a href="'$name$detail_suffix'.html">'$name'</a></td>' >> "$output_html"
+        else
+          echo '<td>'$name'</td>' >> "$output_html"
+        fi
+
+        echo '<td>'$version'</td>' >> "$output_html"
+
+        # Status indicators
+        case "$available" in
+          True)
+            echo '<td><span class="status-indicator status-good"></span>'$available'</td>' >> "$output_html"
+            ;;
+          False)
+            echo '<td><span class="status-indicator status-error"></span>'$available'</td>' >> "$output_html"
+            ;;
+          *)
+            echo '<td>'$available'</td>' >> "$output_html"
+            ;;
+        esac
+
+        case "$progressing" in
+          True)
+            echo '<td><span class="status-indicator status-warning"></span>'$progressing'</td>' >> "$output_html"
+            ;;
+          False)
+            echo '<td><span class="status-indicator status-error"></span>'$progressing'</td>' >> "$output_html"
+            ;;
+          *)
+            echo '<td>'$progressing'</td>' >> "$output_html"
+            ;;
+        esac
+
+        case "$degraded" in
+          True)
+            echo '<td><span class="status-indicator status-error"></span>'$degraded'</td>' >> "$output_html"
+            ;;
+          False)
+            echo '<td><span class="status-indicator status-error"></span>'$degraded'</td>' >> "$output_html"
+            ;;
+          *)
+            echo '<td>'$degraded'</td>' >> "$output_html"
+            ;;
+        esac
+
+        echo '<td>'$since'</td>' >> "$output_html"
+        echo '<td>'$message'</td>' >> "$output_html"
+
+      # Default case for other files
+      else
+        # Generic handling for other tables
+        local col=1
+        for field in $line; do
+          if [[ "$col" -eq "$column_index" && -n "$detail_suffix" ]]; then
+            local link_target
+            if [[ "$detail_suffix" == "../"* ]]; then
+              # This is a relative path format string
+              # shellcheck disable=SC2059
+              link_target=$(printf "$detail_suffix" "$field")
+            else
+              # This is a simple suffix
+              link_target="${field}${detail_suffix}"
+
+              # Verify that the target file exists or will be generated
+              local source_file="${OUTPUT_DIR}/${category}/${field}${detail_suffix}"
+              local html_file="${source_file}.html"
+
+              # If the source file exists but the HTML doesn't, generate it now
+              if [[ -f "$source_file" && ! -f "$html_file" ]]; then
+                log "  [INFO] Pre-generating HTML for linked file: $source_file"
+                generate_detail_page "$(basename "$source_file")" "$source_file" "$html_file" "text" "$category"
+              fi
+            fi
+            echo '<td><a href="'$link_target'.html">'$field'</a></td>' >> "$output_html"
+          else
+            # Add status indicator based on certain known fields
+            case "$field" in
+              Running|True|Active|Ready|Successful|Succeeded)
+                echo '<td><span class="status-indicator status-good"></span>'$field'</td>' >> "$output_html"
+                ;;
+              Error*|Failed|False|NotReady|CrashLoopBackOff|Terminating|InvalidImageName|DeadlineExceeded)
+                echo '<td><span class="status-indicator status-error"></span>'$field'</td>' >> "$output_html"
+                ;;
+              Pending|Unknown|Warning|Provisioning|ContainerCreating|PodInitializing|SchedulingDisabled|Degraded)
+                echo '<td><span class="status-indicator status-warning"></span>'$field'</td>' >> "$output_html"
+                ;;
+              *)
+                echo '<td>'$field'</td>' >> "$output_html"
+                ;;
+            esac
+          fi
+          col=$((col + 1))
+        done
+      fi
+
+      echo '</tr>' >> "$output_html"
+    done
+
+    echo '</tbody></table>' >> "$output_html"
+    echo '</div>' >> "$output_html"
+    echo '</div>' >> "$output_html"
+    echo '</div>' >> "$output_html"
+
+    generate_html_footer >> "$output_html"
+}
+
+# Enhanced detail page with syntax highlighting and better formatting
+generate_detail_page() {
+    local title="$1"
+    local content_file="$2"
+    local output_html="$3"
+    local lang="${4:-text}"
+    local category="${5:-}"
+
+    generate_html_header "$title" "${category}_index" > "$output_html"
+
+    # Add breadcrumb navigation
+    echo '<nav aria-label="breadcrumb">' >> "$output_html"
+    echo '  <ol class="breadcrumb">' >> "$output_html"
+    echo '    <li class="breadcrumb-item"><a href="index.html">Dashboard</a></li>' >> "$output_html"
+    if [[ -n "$category" ]]; then
+      echo '    <li class="breadcrumb-item"><a href="'"${category}_index.html"'">'${CATEGORIES[$category]}'</a></li>' >> "$output_html"
+    fi
+    echo '    <li class="breadcrumb-item active" aria-current="page">'$title'</li>' >> "$output_html"
+    echo '  </ol>' >> "$output_html"
+    echo '</nav>' >> "$output_html"
+
+    echo '<div class="card">' >> "$output_html"
+    echo '<div class="card-header card-header-accent">' >> "$output_html"
+    echo '<i class="fas fa-file-alt me-2"></i>'$title'' >> "$output_html"
+
+    # If this is an error file, show an alert
+    if [[ "$title" == *".err" || "$title" == *"error"* ]]; then
+      echo '<span class="badge bg-danger ms-2">Error</span>' >> "$output_html"
+    fi
+
+    # Show metadata about the file
+    local file_date=$(date -r "$content_file" "+%Y-%m-%d %H:%M:%S" 2>/dev/null || echo "N/A")
+    local file_size=$(du -h "$content_file" | cut -f1 2>/dev/null || echo "N/A")
+    echo '<div class="mt-2 text-muted small">Last modified: '$file_date' | Size: '$file_size'</div>' >> "$output_html"
+
+    echo '</div>' >> "$output_html"
+    echo '<div class="card-body p-0">' >> "$output_html"
+
+    # Check if this is an error file
+    if [[ "$title" == *".err" || "$title" == *"error"* ]]; then
+      echo '<div class="alert alert-danger m-3">' >> "$output_html"
+      echo '<i class="fas fa-exclamation-triangle me-2"></i>This file contains error output.' >> "$output_html"
+      echo '</div>' >> "$output_html"
+    fi
+
+    # If it's a long file, add a message
+    if [[ $(wc -l < "$content_file") -gt 1000 ]]; then
+      echo '<div class="alert alert-info m-3">' >> "$output_html"
+      echo '<i class="fas fa-info-circle me-2"></i>This is a large file with '$(wc -l < "$content_file")' lines.' >> "$output_html"
+      echo '</div>' >> "$output_html"
+    fi
+
+    # File tools section
+    echo '<div class="d-flex justify-content-end p-3">' >> "$output_html"
+    echo '<button class="btn btn-sm btn-outline-primary me-2" id="copyBtn" title="Copy to clipboard"><i class="fas fa-copy me-1"></i>Copy</button>' >> "$output_html"
+    echo '<a href="'$(basename "$content_file")'" class="btn btn-sm btn-outline-secondary" download title="Download raw file"><i class="fas fa-download me-1"></i>Download</a>' >> "$output_html"
+    echo '</div>' >> "$output_html"
+
+    # Display the code with proper syntax highlighting
+    echo '<div class="code-header"><span>' >> "$output_html"
+    echo $(basename "$content_file") >> "$output_html"
+    echo '</span><button class="btn btn-sm btn-dark copy-button" title="Copy to clipboard"><i class="fas fa-copy"></i></button></div>' >> "$output_html"
+    echo '<pre class="line-numbers" data-filename="'$(basename "$content_file")'"><code class="language-'$lang'">' >> "$output_html"
+    cat "$content_file" | escape_html >> "$output_html"
+    echo '</code></pre>' >> "$output_html"
+
+    echo '</div>' >> "$output_html"
+    echo '</div>' >> "$output_html"
+
+    generate_html_footer >> "$output_html"
+}
+
+# Generate a category index page with links to all files in the category
+generate_category_index() {
+    local category_id="$1"
+    local category_name="$2"
+    local category_dir="$3"
+    local output_html="$4"
+
+    generate_html_header "$category_name" "${category_id}_index" > "$output_html"
+
+    # Add breadcrumb navigation
+    echo '<nav aria-label="breadcrumb">' >> "$output_html"
+    echo '  <ol class="breadcrumb">' >> "$output_html"
+    echo '    <li class="breadcrumb-item"><a href="index.html">Dashboard</a></li>' >> "$output_html"
+    echo '    <li class="breadcrumb-item active" aria-current="page">'$category_name'</li>' >> "$output_html"
+    echo '  </ol>' >> "$output_html"
+    echo '</nav>' >> "$output_html"
+
+    echo '<div class="card">' >> "$output_html"
+    echo '<div class="card-header card-header-accent">' >> "$output_html"
+    echo '<i class="fas fa-folder-open me-2"></i>'$category_name'</div>' >> "$output_html"
+    echo '<div class="card-body">' >> "$output_html"
+
+    echo '<div class="list-group">' >> "$output_html"
+
+    # Find all files in the category directory
+    if [[ -d "$category_dir" ]]; then
+        find "$category_dir" -type f -not -name "*.html" | sort | while read -r file; do
+            local filename=$(basename "$file")
+            local file_path="${file#$OUTPUT_DIR/}"
+            local file_icon="fa-file-alt"
+
+            # Set appropriate icon based on file extension
+            case "${filename##*.}" in
+                yaml|yml) file_icon="fa-file-code" ;;
+                json) file_icon="fa-file-code" ;;
+                log) file_icon="fa-file-alt" ;;
+                txt) file_icon="fa-file-alt" ;;
+                err) file_icon="fa-exclamation-triangle" ;;
+                *) file_icon="fa-file" ;;
+            esac
+
+            # Add file size
+            local file_size=$(du -h "$file" | cut -f1 2>/dev/null || echo "N/A")
+
+            # Make sure the HTML file exists or will be generated
+            local html_file="${file}.html"
+            if [[ ! -f "$html_file" ]]; then
+                # Determine the language based on file extension
+                local lang="text"
+                case "${filename##*.}" in
+                    yaml|yml) lang="yaml" ;;
+                    json) lang="json" ;;
+                    log) lang="log" ;;
+                    txt) lang="text" ;;
+                    err) lang="text" ;;
+                    *) lang="text" ;;
+                esac
+
+                # Generate the HTML file if it doesn't exist
+                log "  [INFO] Pre-generating HTML for category index link: $file"
+                generate_detail_page "$filename" "$file" "$html_file" "$lang" "$category_id"
+            fi
+
+            echo '<a href="'$file_path'.html" class="list-group-item list-group-item-action">' >> "$output_html"
+            echo '<i class="fas '$file_icon' me-2"></i>'$filename >> "$output_html"
+            echo '<span class="badge bg-secondary float-end">'$file_size'</span>' >> "$output_html"
+            echo '</a>' >> "$output_html"
+        done
+    else
+        echo '<div class="alert alert-info">No files found in this category.</div>' >> "$output_html"
+    fi
+
+    echo '</div>' >> "$output_html"
+    echo '</div>' >> "$output_html"
+    echo '</div>' >> "$output_html"
+
+    generate_html_footer >> "$output_html"
+}
+
+# Generate a search index for all files in the report
+generate_search_index() {
+    log "Generating search index..."
+    local search_index="${OUTPUT_DIR}/search_index.json"
+
+    # Create a temporary file for building the index
+    local temp_index=$(mktemp)
+    local temp_files=$(mktemp)
+    local temp_html=$(mktemp)
+
+    # Start the JSON array
+    echo '[' > "$temp_index"
+
+    # Find all text files and save to a temporary file to avoid subshell issues
+    find "${OUTPUT_DIR}" -type f \( -name "*.yaml" -o -name "*.json" -o -name "*.log" -o -name "*.txt" -o -name "*.err" \) | sort > "$temp_files"
+
+    # Find all HTML files and save to a temporary file
+    find "${OUTPUT_DIR}" -type f -name "*.html" -not -path "*/\.*" | sort > "$temp_html"
+
+    # Process text files
+    local first_entry=true
+    while read -r file; do
+        # Skip empty files
+        if [[ ! -s "$file" ]]; then
+            continue
+        fi
+
+        local filename=$(basename "$file")
+        local file_path="${file#$OUTPUT_DIR/}"
+        local category=$(dirname "$file" | sed "s|${OUTPUT_DIR}/||")
+        local title="$filename"
+        local file_type="unknown"
+
+        # Determine file type for better search categorization
+        case "${filename##*.}" in
+            yaml|yml) file_type="yaml" ;;
+            json) file_type="json" ;;
+            log) file_type="log" ;;
+            txt) file_type="text" ;;
+            err) file_type="error" ;;
+            *) file_type="other" ;;
+        esac
+
+        # Get more descriptive title based on content for certain files
+        if [[ "$file_type" == "yaml" || "$file_type" == "json" ]]; then
+            # Try to extract kind and name for Kubernetes resources
+            local resource_kind=$(grep -m 1 "kind:" "$file" | awk '{print $2}' 2>/dev/null)
+            local resource_name=$(grep -m 1 "name:" "$file" | awk '{print $2}' 2>/dev/null)
+
+            if [[ -n "$resource_kind" && -n "$resource_name" ]]; then
+                title="$resource_kind: $resource_name"
+            fi
+        fi
+
+        # Extract a sample of content for search (limit to 1500 chars to avoid huge index but improve search quality)
+        local content=$(head -n 30 "$file" | tr '\n' ' ' | sed 's/"/\\"/g' | cut -c 1-1500)
+
+        # Add comma before entry if not the first one
+        if [ "$first_entry" = true ]; then
+            first_entry=false
+        else
+            echo ',' >> "$temp_index"
+        fi
+
+        # Write the entry to the search index with additional metadata
+        cat << EOF >> "$temp_index"
+{
+  "title": "$title",
+  "path": "$file_path.html",
+  "category": "$category",
+  "type": "$file_type",
+  "filename": "$filename",
+  "content": "$content"
+}
+EOF
+    done < "$temp_files"
+
+    # Process HTML files
+    while read -r file; do
+        # Skip empty files and already indexed content (avoid duplicates)
+        if [[ ! -s "$file" ]] || [[ "$file" == *".html.html" ]]; then
+            continue
+        fi
+
+        local filename=$(basename "$file")
+        local file_path="${file#$OUTPUT_DIR/}"
+        local category="pages"
+        local title="$filename"
+
+        # Try to extract the page title from HTML
+        local html_title=$(grep -o '<title>.*</title>' "$file" | sed 's/<title>\(.*\) - OpenShift Cluster Report<\/title>/\1/' 2>/dev/null)
+        if [[ -n "$html_title" ]]; then
+            title="$html_title"
+        fi
+
+        # Extract text content from HTML (basic approach)
+        local content=$(grep -v '<[^>]*>' "$file" | grep -v '^[[:space:]]*$' | head -n 50 | tr '\n' ' ' | sed 's/"/\\"/g' | cut -c 1-1500)
+
+        # Add comma before entry if we have previous entries
+        if [ "$first_entry" = true ]; then
+            first_entry=false
+        else
+            echo ',' >> "$temp_index"
+        fi
+
+        # Write the entry to the search index
+        cat << EOF >> "$temp_index"
+{
+  "title": "$title",
+  "path": "$file_path",
+  "category": "$category",
+  "type": "html",
+  "filename": "$filename",
+  "content": "$content"
+}
+EOF
+    done < "$temp_html"
+
+    # Close the JSON array
+    echo ']' >> "$temp_index"
+
+    # Move the temp file to the final location
+    mv "$temp_index" "$search_index"
+
+    # Clean up temporary files
+    rm -f "$temp_files" "$temp_html"
+
+    # Generate a search statistics file for debugging
+    local index_size=$(du -h "$search_index" | cut -f1)
+    local file_count=$(grep -o '"path":' "$search_index" | wc -l)
+
+    log "Search index generated: $search_index"
+    log "  [INFO] Search index contains $file_count files, size: $index_size"
+
+    # Verify the JSON is valid
+    if ! grep -q ']' "$search_index"; then
+        log "  [ERROR] Search index JSON may be invalid - missing closing bracket"
+        # Add a closing bracket if missing
+        echo ']' >> "$search_index"
+    fi
+}
+
+# Orchestrate the entire HTML report generation
+generate_report() {
+    log "Generating HTML Report..."
+    generate_main_index
+
+    # Function to check if directory exists and has files
+    has_content() {
+        local dir="$1"
+        [[ -d "$dir" ]] && [[ $(find "$dir" -type f | wc -l) -gt 0 ]]
+    }
+
+    # Generate all category index pages referenced in the sidebar
+    # This ensures we have all the pages that are linked in the navigation
+    generate_category_index "basic" "Basic Info" "${OUTPUT_DIR}" "${OUTPUT_DIR}/basic_index.html"
+    generate_category_index "clusterversion_history" "Version History" "${OUTPUT_DIR}/version" "${OUTPUT_DIR}/clusterversion_history_index.html"
+    generate_category_index "nodes" "Nodes" "${OUTPUT_DIR}/nodes" "${OUTPUT_DIR}/nodes_index.html"
+    generate_category_index "operators" "Operators" "${OUTPUT_DIR}/operators" "${OUTPUT_DIR}/operators_index.html"
+    generate_category_index "etcd" "etcd" "${OUTPUT_DIR}/etcd" "${OUTPUT_DIR}/etcd_index.html"
+    generate_category_index "api_resources" "API Resources" "${OUTPUT_DIR}" "${OUTPUT_DIR}/api_resources_index.html"
+    generate_category_index "namespaces" "Namespaces" "${OUTPUT_DIR}/namespaces" "${OUTPUT_DIR}/namespaces_index.html"
+    generate_category_index "namespace_resources" "Namespace Details" "${OUTPUT_DIR}/namespace_resources" "${OUTPUT_DIR}/namespace_resources_index.html"
+    generate_category_index "cluster_resources" "Cluster Resources" "${OUTPUT_DIR}/cluster_resources" "${OUTPUT_DIR}/cluster_resources_index.html"
+    generate_category_index "crd_instances" "CRD Instances" "${OUTPUT_DIR}/crd_instances" "${OUTPUT_DIR}/crd_instances_index.html"
+    generate_category_index "builds" "Builds & Images" "${OUTPUT_DIR}/builds" "${OUTPUT_DIR}/builds_index.html"
+    generate_category_index "network" "Networking" "${OUTPUT_DIR}/network" "${OUTPUT_DIR}/network_index.html"
+    generate_category_index "storage" "Storage" "${OUTPUT_DIR}/storage" "${OUTPUT_DIR}/storage_index.html"
+    generate_category_index "machine_api" "Machine API" "${OUTPUT_DIR}/machine_api" "${OUTPUT_DIR}/machine_api_index.html"
+    generate_category_index "security" "Security" "${OUTPUT_DIR}/security" "${OUTPUT_DIR}/security_index.html"
+    generate_category_index "rbac" "RBAC" "${OUTPUT_DIR}/rbac" "${OUTPUT_DIR}/rbac_index.html"
+    generate_category_index "metrics" "Metrics" "${OUTPUT_DIR}/metrics" "${OUTPUT_DIR}/metrics_index.html"
+    generate_category_index "autoscalers" "Autoscalers" "${OUTPUT_DIR}/autoscalers" "${OUTPUT_DIR}/autoscalers_index.html"
+    generate_category_index "events" "Events" "${OUTPUT_DIR}/events" "${OUTPUT_DIR}/events_index.html"
+    generate_category_index "logs" "Logs" "${OUTPUT_DIR}/logs" "${OUTPUT_DIR}/logs_index.html"
+    generate_category_index "audit" "Audit Config" "${OUTPUT_DIR}/audit" "${OUTPUT_DIR}/audit_index.html"
+
+    # DataTable pages for tabular data - only generate if file exists
+    if [ -f "${OUTPUT_DIR}/nodes/nodes_wide.txt" ]; then
+      generate_datatable_page "Nodes Table" "${OUTPUT_DIR}/nodes/nodes_wide.txt" "${OUTPUT_DIR}/nodes_table.html" "nodes" "${DATATABLE_FILES["nodes_wide.txt"]}"
+    fi
+    if [ -f "${OUTPUT_DIR}/operators/clusteroperators.txt" ]; then
+      generate_datatable_page "Operators Table" "${OUTPUT_DIR}/operators/clusteroperators.txt" "${OUTPUT_DIR}/operators_table.html" "operators" "${DATATABLE_FILES["clusteroperators.txt"]}"
+    fi
+
+    # Generic detail pages (YAML, JSON, log, txt)
+    for f in $(find "${OUTPUT_DIR}" -type f \( -name "*.yaml" -o -name "*.json" -o -name "*.log" -o -name "*.txt" -o -name "*.err" \)); do
+      # Skip empty files
+      if [[ ! -s "$f" ]]; then
+        log "  [SKIP] Empty file: $f"
+        continue
+      fi
+
+      ext="${f##*.}"
+      case "$ext" in
+        yaml|yml) lang="yaml" ;;
+        json) lang="json" ;;
+        log) lang="log" ;;
+        txt) lang="text" ;;
+        err) lang="text" ;;
+        *) lang="text" ;;
+      esac
+      category=$(dirname "$f" | sed "s|${OUTPUT_DIR}/||")
+
+      # Create the HTML file in the same directory as the source file
+      local html_file="${f}.html"
+      generate_detail_page "$(basename "$f")" "$f" "$html_file" "$lang" "$category"
+
+      # Log the generated file for debugging
+      log "  [INFO] Generated detail page: $html_file"
+    done
+
+    # Generate search index for global search functionality
+    generate_search_index
+
+    # Create a simple README file in the output directory
+    cat << EOF > "${OUTPUT_DIR}/README.txt"
+OpenShift Cluster Report
+=======================
+
+This report contains information collected from an OpenShift cluster.
+To view the report, open the index.html file in a web browser.
+
+The report includes:
+- Cluster configuration
+- Node information
+- Operator status
+- Network configuration
+- Storage resources
+- Security settings
+- And more...
+
+Use the global search feature to search across all files in the report.
+EOF
+
+    log "HTML Report generation complete: ${OUTPUT_DIR}/index.html"
+}
+
+# Create the main index/dashboard page with cluster summary
+generate_main_index() {
+    local out_file="${OUTPUT_DIR}/index.html"
+    local current_date=$(date +"%Y-%m-%d %H:%M:%S")
+
+    # Dynamic status calculation for nodes and operators
+    local node_total=$(awk 'NR>1' "${OUTPUT_DIR}/nodes/nodes_wide.txt" | wc -l)
+    local node_ready=$(awk 'NR>1 && $2=="Ready"' "${OUTPUT_DIR}/nodes/nodes_wide.txt" | wc -l)
+    local node_ready_percent=$((node_ready * 100 / (node_total > 0 ? node_total : 1)))
+
+    local operator_total=$(awk 'NR>1' "${OUTPUT_DIR}/operators/clusteroperators.txt" | wc -l)
+    local operator_available=$(awk 'NR>1 && $3=="True"' "${OUTPUT_DIR}/operators/clusteroperators.txt" | wc -l)
+    local operator_available_percent=$((operator_available * 100 / (operator_total > 0 ? operator_total : 1)))
+
+    # Extract cluster version from the collected data
+    local cluster_version="Unknown"
+    local version_status="Unknown"
+    if [ -f "${OUTPUT_DIR}/clusterversion.yaml" ]; then
+        cluster_version=$(grep -A1 'version:' "${OUTPUT_DIR}/clusterversion.yaml" | grep -v 'version:' | tr -d ' ' || echo "Unknown")
+        version_status=$(grep -A1 "type: Available" "${OUTPUT_DIR}/clusterversion.yaml" | grep "status:" | awk '{print $2}' || echo "Unknown")
+    fi
+
+    # Generate HTML header with the custom dashboard layout
+    generate_html_header "Cluster Dashboard" "dashboard" > "$out_file"
+
+    # Page header with cluster name and report timestamp
+    cat << EOF >> "$out_file"
+<div class="p-3 bg-light rounded-3 mb-4">
+  <div class="container-fluid">
+    <div class="row align-items-center">
+      <div class="col-md-8">
+        <h1 class="display-5 fw-bold">OpenShift Cluster Report</h1>
+        <p class="fs-4">Comprehensive analysis of cluster configuration and resources</p>
+        <p class="text-muted">Generated on: ${current_date}</p>
+      </div>
+      <div class="col-md-4 text-end">
+        <img src="data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAxMDAgMTAwIj48ZGVmcz48c3R5bGU+LmNsc3QtMXtmaWxsOiNkYTI5MmU7fS5jbHN0LTJ7ZmlsbDojYzkyMjI3O30uY2xzdC0ze2ZpbGw6I2VlMGEwYTt9LmNsc3QtNHtmaWxsOiNmZmZmZmY7fTwvc3R5bGU+PC9kZWZzPjxwYXRoIGQ9Ik03Mi4yNzcsMTguOTE1bC0xNC43MzYsMTVjLS41MjEuNTIxLTEuMDQyLjc4MS0xLjU2My43ODFoLTIuMzQ0YTEuNTUsMS41NSwwLDAsMC0xLjU2My0xLjU2M0g0Ni4zMzZWMjcuNGE1LjMyNCw1LjMyNCwwLDAsMCwxLjU2My0uMjYxTDYzLjQ3NCwxMS4xOTJBNDkuODEsNDkuODEsMCwwLDAsNTAsOWE0MSw0MSwwLDEsMCw0MSw0MUE0OS4yOTQsNDkuMjk0LDAsMCwwLDcyLjI3NywxOC45MTV6IiBjbGFzcz0iY2xzdC0xIi8+PHBhdGggZD0iTTc2LjYyMyw1OS44OWwtMTYuMy0xMS40NThjLTEuMDQyLS43ODEtMi4zNDQtMS4zMDItMy42NDYtMS4zMDJIMzIuMTIxdjcuMDI5YTEuNjc1LDEuNjc1LDAsMCwxLTEuNTYzLDEuNTYzSDIxLjE4NWMtLjc4MSwwLTEuMzAyLS41MjEtMS41NjMtMS4zMDJsLTIuODY1LTcuODEtMi44NjUsNy41NDdjLS4yNjEuNzgxLS43ODEsMS41NjMtMS41NjMsMS41NjNoLTkuMTFjLS41MjEsMC0xLjA0Mi0uMjYxLTEuMzAyLS43ODEtLjI2MS0uNTIxLS41MjEtMS4wNDIsMC0xLjU2M0wxMS44MTQsNDAuODM1LDIuMTg1LDI3LjQxYy0uNTIxLS41MjEtLjI2MS0xLjMwMiwwLTEuNTYzLjI2MS0uNTIxLjc4MS0uNzgxLDEuMzAyLS43ODFoOS4xMWMuNzgxLDAsMS4zMDIuNTIxLDEuNTYzLDEuMzAybDIuODY1LDcuNTQ5LDIuODY1LTcuODFjLjI2MS0uNzgxLjc4MS0xLjMwMiwxLjU2My0xLjMwMmg5LjYzMWMuNzgxLDAsMS41NjMuNzgxLDEuNTYzLDEuNTYzVjMzLjM2M2gyNC41NTVjMS4zMDIsMCwyLjYwNC0uNTIxLDMuNjQ2LTEuMzAybDE2LjMtMTEuNDU4YTQxLjQ5MSw0MS40OTEsMCwwLDEsMi42MDQsMTQuNTgzQTM4LjA4LDM4LjA4LDAsMCwxLDc2LjYyMyw1OS44OVoiIGNsYXNzPSJjbHN0LTIiLz48cGF0aCBkPSJNNDkuMTM0LDMzLjM2MywzMi44MzQsNDcuMDY1YTQuODA4LDQuODA4LDAsMCwwLTEuNTYzLDMuNjQ2VjgwLjMwOEE0MS4zNDMsNDEuMzQzLDAsMCwwLDUwLDkxYTM3LjYzLDM3LjYzLDAsMCwwLDE2LjAzNy0zLjM4NVY0Ny4wNjVBNC44MDgsNC44MDgsMCwwLDAsNjQuNDc0LDQzLjQyTDQ4LjY5MiwyOS4yLDMwLjU1OSw0OC4xMDdBMS43NTYsMS43NTYsMCwwLDEsMjksMzMuMWMuNTIxLS43ODEsMS4zMDItLjUyMSwyLjA4MywwTDQzLjk5LDIwLjIxN2ExLjgsMS44LDAsMCwxLDIuNjA0LDBsMi4wODMsMi4wODNWMjcuNGgzLjkwN3YyLjYwNEw2Mi42LDIwLjIxN2EzLjc2NCwzLjc2NCwwLDAsMSwyLjYwNCwwbDEzLjY5NCwxMy40MzNjLjc4MS43ODEsMS4zMDIsMSwuNTIxLDEuNTYzcy0yLjA4My41MjEtMi44NjUsMGwtMTIuMTMxLTExLjg3MVoiIGNsYXNzPSJjbHN0LTMiLz48L3N2Zz4=" alt="OpenShift Logo" style="height: 100px;">
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Status cards row -->
+<div class="row mb-4">
+  <!-- Cluster Version Card -->
+  <div class="col-md-4 mb-4">
+    <div class="card h-100 border-0 shadow-sm">
+      <div class="card-body">
+        <div class="d-flex align-items-center mb-3">
+          <i class="fas fa-tag fs-4 text-primary me-3"></i>
+          <h5 class="card-title m-0">Cluster Version</h5>
+        </div>
+        <h2 class="display-6 fw-bold">${cluster_version}</h2>
+        <div class="mt-3">
+          <span class="badge ${version_status == "True" ? "bg-success" : "bg-warning"} p-2">
+            ${version_status == "True" ? "Up to date" : "Version status: ${version_status}"}
+          </span>
+        </div>
+        <a href="clusterversion.yaml.html" class="btn btn-outline-primary btn-sm mt-3">
+          <i class="fas fa-info-circle me-1"></i>View Details
+        </a>
+      </div>
+    </div>
+  </div>
+
+  <!-- Node Status Card -->
+  <div class="col-md-4 mb-4">
+    <div class="card h-100 border-0 shadow-sm">
+      <div class="card-body">
+        <div class="d-flex align-items-center mb-3">
+          <i class="fas fa-server fs-4 text-success me-3"></i>
+          <h5 class="card-title m-0">Node Status</h5>
+        </div>
+        <div class="progress mb-3" style="height: 15px;">
+          <div class="progress-bar bg-success" role="progressbar" style="width: ${node_ready_percent}%;"
+               aria-valuenow="${node_ready_percent}" aria-valuemin="0" aria-valuemax="100">${node_ready_percent}%</div>
+        </div>
+        <p class="card-text fs-5">${node_ready} of ${node_total} nodes ready</p>
+        <a href="nodes_table.html" class="btn btn-outline-success btn-sm mt-1">
+          <i class="fas fa-list me-1"></i>View Nodes
+        </a>
+      </div>
+    </div>
+  </div>
+
+  <!-- Operator Health Card -->
+  <div class="col-md-4 mb-4">
+    <div class="card h-100 border-0 shadow-sm">
+      <div class="card-body">
+        <div class="d-flex align-items-center mb-3">
+          <i class="fas fa-cogs fs-4 text-info me-3"></i>
+          <h5 class="card-title m-0">Operator Health</h5>
+        </div>
+        <div class="progress mb-3" style="height: 15px;">
+          <div class="progress-bar bg-info" role="progressbar" style="width: ${operator_available_percent}%;"
+               aria-valuenow="${operator_available_percent}" aria-valuemin="0" aria-valuemax="100">${operator_available_percent}%</div>
+        </div>
+        <p class="card-text fs-5">${operator_available} of ${operator_total} operators available</p>
+        <a href="operators_table.html" class="btn btn-outline-info btn-sm mt-1">
+          <i class="fas fa-list me-1"></i>View Operators
+        </a>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Navigation Category Cards -->
+<div class="row mb-4">
+  <div class="col-12">
+    <h4 class="mb-3">Report Categories</h4>
+  </div>
+EOF
+
+    # Generate category cards (using the CATEGORIES array)
+    echo '<div class="row row-cols-1 row-cols-md-3 g-4 mb-4">' >> "$out_file"
+
+    # Define a fixed set of icons and colors for categories
+    declare -A category_icons=(
+        ["basic"]="fa-info-circle,text-primary"
+        ["clusterversion_history"]="fa-history,text-primary"
+        ["nodes"]="fa-server,text-success"
+        ["operators"]="fa-cogs,text-info"
+        ["etcd"]="fa-database,text-danger"
+        ["api_resources"]="fa-code,text-secondary"
+        ["namespaces"]="fa-project-diagram,text-primary"
+        ["namespace_resources"]="fa-cubes,text-primary"
+        ["cluster_resources"]="fa-cloud,text-info"
+        ["crd_instances"]="fa-puzzle-piece,text-warning"
+        ["builds"]="fa-hammer,text-secondary"
+        ["network"]="fa-network-wired,text-primary"
+        ["storage"]="fa-hdd,text-info"
+        ["machine_api"]="fa-robot,text-secondary"
+        ["security"]="fa-shield-alt,text-danger"
+        ["rbac"]="fa-users-cog,text-warning"
+        ["metrics"]="fa-chart-line,text-success"
+        ["autoscalers"]="fa-expand-arrows-alt,text-info"
+        ["events"]="fa-exclamation-circle,text-warning"
+        ["logs"]="fa-file-alt,text-secondary"
+        ["audit"]="fa-file-signature,text-info"
+    )
+
+    # Skip 'dashboard' which is this page
+    for category in "${!CATEGORIES[@]}"; do
+        if [[ "$category" == "dashboard" ]]; then
+            continue
+        fi
+
+        # Skip categories that don't have content
+        local category_dir="${OUTPUT_DIR}/${category//_//}"  # Replace underscores with slashes
+        if [[ ! -d "$category_dir" ]] || [[ $(find "$category_dir" -type f | wc -l) -eq 0 ]]; then
+            log "  [SKIP] Empty category in dashboard: $category"
+            continue
+        fi
+
+        # Only show categories that have generated index pages
+        if [[ ! -f "${OUTPUT_DIR}/${category}_index.html" ]]; then
+            log "  [SKIP] Missing index page in dashboard: $category"
+            continue
+        fi
+
+        # Get icon and color for this category, default if not found
+        icon_info="${category_icons[$category]:-fa-folder,text-secondary}"
+        icon_class=$(echo "$icon_info" | cut -d ',' -f1)
+        color_class=$(echo "$icon_info" | cut -d ',' -f2)
+
+        # Create category card
+        cat << EOF >> "$out_file"
+<div class="col">
+  <div class="card h-100 shadow-sm">
+    <div class="card-body">
+      <div class="d-flex align-items-center mb-3">
+        <i class="fas ${icon_class} fs-4 ${color_class} me-3"></i>
+        <h5 class="card-title m-0">${CATEGORIES[$category]}</h5>
+      </div>
+      <p class="card-text">Browse ${CATEGORIES[$category]} information and configuration.</p>
+    </div>
+    <div class="card-footer bg-transparent border-0">
+      <a href="${category}_index.html" class="btn btn-primary">View Details</a>
+    </div>
+  </div>
+</div>
+EOF
+    done
+
+    echo '</div>' >> "$out_file"  # Close row of category cards
+
+    # Add a section for common actions or quick links
+    cat << EOF >> "$out_file"
+<!-- Quick Links Section -->
+<div class="card mb-4 shadow-sm">
+  <div class="card-header card-header-accent">
+    <i class="fas fa-link me-2"></i>Quick Access
+  </div>
+  <div class="card-body">
+    <div class="row">
+      <div class="col-md-4 mb-3">
+        <h6><i class="fas fa-server me-2 text-success"></i>Infrastructure</h6>
+        <ul class="list-unstyled ms-3">
+          <li><a href="nodes_table.html">Nodes</a></li>
+          <li><a href="infrastructure.yaml.html">Cluster Infrastructure</a></li>
+          <li><a href="machine_api_index.html">Machine API</a></li>
+        </ul>
+      </div>
+      <div class="col-md-4 mb-3">
+        <h6><i class="fas fa-shield-alt me-2 text-danger"></i>Security & Access</h6>
+        <ul class="list-unstyled ms-3">
+          <li><a href="rbac_index.html">RBAC Configuration</a></li>
+          <li><a href="security_index.html">Security Context Constraints</a></li>
+          <li><a href="security/oauth.yaml.html">Authentication</a></li>
+        </ul>
+      </div>
+      <div class="col-md-4 mb-3">
+        <h6><i class="fas fa-network-wired me-2 text-primary"></i>Network & Storage</h6>
+        <ul class="list-unstyled ms-3">
+          <li><a href="network_index.html">Network Configuration</a></li>
+          <li><a href="storage_index.html">Storage Resources</a></li>
+          <li><a href="network/network_config.yaml.html">Cluster Network</a></li>
+        </ul>
+      </div>
+    </div>
+  </div>
+</div>
+EOF
+
+    generate_html_footer >> "$out_file"
+}
+
+# --- Main Execution (after collection) ---
+echo "Starting OpenShift cluster data collection..."
+
+show_progress "Basic cluster info"
+collect_basic
+
+show_progress "Node details"
+collect_nodes
+
+show_progress "Operators"
+collect_operators
+
+show_progress "Network configuration"
+collect_network
+
+show_progress "Security details"
+collect_security
+
+show_progress "Metrics"
+collect_metrics
+
+show_progress "etcd details"
+collect_etcd
+
+show_progress "Logs"
+collect_logs
+
+show_progress "Namespaces"
+collect_namespaces
+
+show_progress "Cluster resources"
+collect_cluster_resources
+
+show_progress "Namespace resources"
+collect_namespace_resources
+
+show_progress "Audit logs"
+collect_audit_logs
+
+show_progress "RBAC resources"
+collect_rbac
+
+show_progress "CRD instances"
+collect_crd_instances
+
+show_progress "Storage resources"
+collect_storage
+
+# Update TOTAL_STEPS if adding more collection steps
+
+# --- Enhanced HTML Report Generation ---
+echo "\nGenerating HTML report..."
+generate_report
+
+tar czf "${OUTPUT_DIR}.tar.gz" "${OUTPUT_DIR}" && log "Output compressed: ${OUTPUT_DIR}.tar.gz"
+
+echo "Collection complete. Final report: ${OUTPUT_DIR}/index.html"
